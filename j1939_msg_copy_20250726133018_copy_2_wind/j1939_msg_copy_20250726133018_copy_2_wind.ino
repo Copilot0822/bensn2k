@@ -1,4 +1,11 @@
 #include <due_can.h>
+#include <AS5600.h>
+
+
+AS5600 as5600;
+
+
+
 
 #define CAN_BUS_SPEED 250000
 CAN_FRAME frame;
