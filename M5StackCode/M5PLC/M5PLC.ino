@@ -31,21 +31,17 @@ twai_message_t apparentWindFrame(double directionDeg, double speedKnots) {
 
   n2kdata.identifier = calcFrameId(priority, pgn, source);
 
-  // SID
-  n2kdata.data[0] = 0xFF;
+  n2kdata.data[0] = 0xFF;  // SID
 
-  // speed in 0.01 m/s
   uint16_t speedN2K = (uint16_t)lround(speedKnots * 0.514444444 * 100.0);
   n2kdata.data[1] = speedN2K & 0xFF;
   n2kdata.data[2] = (speedN2K >> 8) & 0xFF;
 
-  // angle in 0.0001 rad
   uint16_t angleN2K = (uint16_t)lround((directionDeg * M_PI / 180.0) * 10000.0);
   n2kdata.data[3] = angleN2K & 0xFF;
   n2kdata.data[4] = (angleN2K >> 8) & 0xFF;
 
-  // ref = 2 apparent, rest reserved
-  n2kdata.data[5] = 2;
+  n2kdata.data[5] = 2;     // apparent
   n2kdata.data[6] = 0xFF;
   n2kdata.data[7] = 0xFF;
 
@@ -63,18 +59,14 @@ twai_message_t batteryStatusFrame(uint8_t instance, double voltage, double curre
 
   n2kdata.identifier = calcFrameId(priority, pgn, source);
 
-  int16_t voltN2K = (int16_t)lround(voltage * 100.0);  // 0.01 V
-  int16_t ampN2K  = (int16_t)lround(current * 10.0);   // 0.1 A
+  int16_t voltN2K = (int16_t)lround(voltage * 100.0);
+  int16_t ampN2K  = (int16_t)lround(current * 10.0);
 
   n2kdata.data[0] = instance;
-
   n2kdata.data[1] = voltN2K & 0xFF;
   n2kdata.data[2] = (voltN2K >> 8) & 0xFF;
-
   n2kdata.data[3] = ampN2K & 0xFF;
   n2kdata.data[4] = (ampN2K >> 8) & 0xFF;
-
-  // temp + SID not available yet
   n2kdata.data[5] = 0xFF;
   n2kdata.data[6] = 0xFF;
   n2kdata.data[7] = 0xFF;
@@ -88,7 +80,7 @@ esp_err_t postCanMessage(twai_message_t& message, TickType_t timeout_ticks = pdM
 
 float getAngleDegrees(AS5600& encoder) {
   float angle = encoder.rawAngle() * 360.0f / 4096.0f;
-  angle += 0.0f;  // offset here
+  angle += 0.0f;   // put your offset here
 
   while (angle < 0.0f) angle += 360.0f;
   while (angle >= 360.0f) angle -= 360.0f;
@@ -96,16 +88,54 @@ float getAngleDegrees(AS5600& encoder) {
   return angle;
 }
 
-TwoWire i2cA = TwoWire(0);
-TwoWire i2cC = TwoWire(1);
+// I2C buses
+TwoWire i2cA = TwoWire(0);   // PORT.A: SDA=G2, SCL=G1
+TwoWire i2cC = TwoWire(1);   // PORT.C: SDA=G5, SCL=G4
 
 INA226 batt1(0x41, &i2cA);
 INA226 batt2(0x41, &i2cC);
 AS5600 encoder(&i2cA);
 
+// latest values for screen
+double latestBatt0 = 0.0;
+double latestBatt1 = 0.0;
+double latestWindDeg = 0.0;
+
 uint32_t timebatt0 = 0;
 uint32_t timebatt1 = 0;
 uint32_t timeWind  = 0;
+uint32_t timeScreen = 0;
+
+void initDisplay() {
+  M5StamPLC.Display.fillScreen(TFT_BLACK);
+  M5StamPLC.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5StamPLC.Display.setTextSize(2);
+}
+
+void drawDisplay() {
+  M5StamPLC.Display.fillScreen(TFT_BLACK);
+
+  M5StamPLC.Display.setCursor(10, 10);
+  M5StamPLC.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5StamPLC.Display.setTextSize(2);
+  M5StamPLC.Display.println("BF50 Monitor");
+
+  M5StamPLC.Display.setCursor(10, 45);
+  M5StamPLC.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+  M5StamPLC.Display.printf("Batt 0: %.2f V\n", latestBatt0);
+
+  M5StamPLC.Display.setCursor(10, 75);
+  M5StamPLC.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+  M5StamPLC.Display.printf("Batt 1: %.2f V\n", latestBatt1);
+
+  M5StamPLC.Display.setCursor(10, 105);
+  M5StamPLC.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+  M5StamPLC.Display.printf("Angle : %.1f deg\n", latestWindDeg);
+
+  M5StamPLC.Display.setCursor(10, 135);
+  M5StamPLC.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5StamPLC.Display.printf("CAN: 250k");
+}
 
 void setup() {
   Serial.begin(115200);
@@ -116,9 +146,10 @@ void setup() {
   M5StamPLC.config(config);
   M5StamPLC.begin();
 
+  initDisplay();
+
   i2cA.setPins(2, 1);
   i2cC.setPins(5, 4);
-
   i2cA.begin();
   i2cC.begin();
 
@@ -138,12 +169,17 @@ void setup() {
   } else {
     Serial.println("Battery sensor 2 OK");
   }
+
+  latestBatt0 = batt1.getBusVoltage();
+  latestBatt1 = batt2.getBusVoltage();
+  latestWindDeg = getAngleDegrees(encoder);
+  drawDisplay();
 }
 
 void loop() {
   if (millis() - timebatt0 > 1500) {
-    double voltage0 = batt1.getBusVoltage();
-    twai_message_t msg = batteryStatusFrame(0, voltage0);
+    latestBatt0 = batt1.getBusVoltage();
+    twai_message_t msg = batteryStatusFrame(0, latestBatt0);
     if (postCanMessage(msg) != ESP_OK) {
       Serial.println("Failed CAN Send batt0");
     }
@@ -151,8 +187,8 @@ void loop() {
   }
 
   if (millis() - timebatt1 > 1500) {
-    double voltage1 = batt2.getBusVoltage();
-    twai_message_t msg = batteryStatusFrame(1, voltage1);
+    latestBatt1 = batt2.getBusVoltage();
+    twai_message_t msg = batteryStatusFrame(1, latestBatt1);
     if (postCanMessage(msg) != ESP_OK) {
       Serial.println("Failed CAN Send batt1");
     }
@@ -160,11 +196,17 @@ void loop() {
   }
 
   if (millis() - timeWind > 100) {
-    double windDeg = getAngleDegrees(encoder);
-    twai_message_t msg = apparentWindFrame(windDeg, 10.0);
+    latestWindDeg = getAngleDegrees(encoder);
+    twai_message_t msg = apparentWindFrame(latestWindDeg, 10.0);
     if (postCanMessage(msg) != ESP_OK) {
       Serial.println("Failed CAN Send wind");
     }
     timeWind = millis();
+  }
+
+  // refresh screen at 5 Hz
+  if (millis() - timeScreen > 200) {
+    drawDisplay();
+    timeScreen = millis();
   }
 }
