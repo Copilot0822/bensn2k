@@ -15,6 +15,15 @@ constexpr uint32_t kSamplePeriodMs = 500;
 constexpr uint32_t kSendPeriodMs = 1500;
 constexpr uint32_t kDisplayPeriodMs = 500;
 constexpr uint8_t kInaAddress = 0x41;
+constexpr uint8_t kInaRegConfig = 0x00;
+constexpr uint8_t kInaRegBusVoltage = 0x02;
+constexpr uint8_t kInaRegCalibration = 0x05;
+constexpr uint8_t kInaRegManufacturerId = 0xFE;
+constexpr uint8_t kInaRegDieId = 0xFF;
+constexpr uint16_t kInaManufacturerId = 0x5449;
+constexpr uint16_t kInaDieId = 0x2260;
+constexpr uint16_t kInaConfigValue = 0x4527;
+constexpr uint16_t kInaCalibrationValue = 0x0800;
 constexpr gpio_num_t kCanTxPin = GPIO_NUM_42;
 constexpr gpio_num_t kCanRxPin = GPIO_NUM_43;
 
@@ -35,6 +44,8 @@ BatteryChannel batteries[] = {
     {"Port A", 2, 1, 0, false, NAN, 0},
     {"Port C", 5, 4, 1, false, NAN, 0},
 };
+
+constexpr size_t kBatteryCount = sizeof(batteries) / sizeof(batteries[0]);
 
 uint32_t lastSampleMs = 0;
 uint32_t lastSendMs = 0;
@@ -79,7 +90,7 @@ void updateDisplay() {
   M5.Display.setCursor(marginX, marginY);
   M5.Display.println("Battery Monitor");
 
-  for (size_t i = 0; i < (sizeof(batteries) / sizeof(batteries[0])); ++i) {
+  for (size_t i = 0; i < kBatteryCount; ++i) {
     const auto& battery = batteries[i];
     const int rowTop = contentTop + static_cast<int>(i) * rowHeight;
     const int valueY = rowTop + 16;
@@ -148,6 +159,8 @@ void activateExternalBus(const BatteryChannel& battery) {
     return;
   }
 
+  // Rebinding the same hardware bus is required on this board. Without end(),
+  // the ESP32 Wire implementation can keep talking to the previous port pins.
   recoverI2CBus(battery.sdaPin, battery.sclPin);
   delay(2);
   externalBus.end();
@@ -185,22 +198,20 @@ bool writeRegister16(uint8_t address, uint8_t reg, uint16_t value) {
 bool verifyIna226() {
   uint16_t manufacturerId = 0;
   uint16_t dieId = 0;
-  return readRegister16(kInaAddress, 0xFE, manufacturerId)
-      && readRegister16(kInaAddress, 0xFF, dieId)
-      && manufacturerId == 0x5449
-      && dieId == 0x2260;
+  return readRegister16(kInaAddress, kInaRegManufacturerId, manufacturerId)
+      && readRegister16(kInaAddress, kInaRegDieId, dieId)
+      && manufacturerId == kInaManufacturerId
+      && dieId == kInaDieId;
 }
 
 bool configureIna226() {
-  constexpr uint16_t kConfig = 0x4527;
-  constexpr uint16_t kCalibration = 0x0800;
-  return writeRegister16(kInaAddress, 0x00, kConfig)
-      && writeRegister16(kInaAddress, 0x05, kCalibration);
+  return writeRegister16(kInaAddress, kInaRegConfig, kInaConfigValue)
+      && writeRegister16(kInaAddress, kInaRegCalibration, kInaCalibrationValue);
 }
 
 bool readBusVoltage(float& voltage) {
   uint16_t raw = 0;
-  if (!readRegister16(kInaAddress, 0x02, raw)) {
+  if (!readRegister16(kInaAddress, kInaRegBusVoltage, raw)) {
     return false;
   }
 
@@ -238,6 +249,12 @@ void sampleBattery(BatteryChannel& battery) {
   }
 }
 
+void sampleBatteries() {
+  for (auto& battery : batteries) {
+    sampleBattery(battery);
+  }
+}
+
 void sendBatteryStatus(BatteryChannel& battery) {
   tN2kMsg message;
   const double voltage = battery.present ? battery.voltage : N2kDoubleNA;
@@ -250,6 +267,12 @@ void sendBatteryStatus(BatteryChannel& battery) {
     Serial.printf("%.3f V\n", battery.voltage);
   } else {
     Serial.println("NA");
+  }
+}
+
+void sendBatteryStatuses() {
+  for (auto& battery : batteries) {
+    sendBatteryStatus(battery);
   }
 }
 
@@ -300,7 +323,7 @@ void setupDisplay() {
     M5.Display.setRotation(M5.Display.getRotation() ^ 1);
   }
   M5.Display.setTextFont(2);
-  M5.Display.setTextSize(2);
+  M5.Display.setTextSize(1);
   M5.Display.fillScreen(TFT_BLACK);
 }
 
@@ -328,16 +351,12 @@ void loop() {
   const uint32_t now = millis();
 
   if (now - lastSampleMs >= kSamplePeriodMs) {
-    for (auto& battery : batteries) {
-      sampleBattery(battery);
-    }
+    sampleBatteries();
     lastSampleMs = now;
   }
 
   if (now - lastSendMs >= kSendPeriodMs) {
-    for (auto& battery : batteries) {
-      sendBatteryStatus(battery);
-    }
+    sendBatteryStatuses();
     lastSendMs = now;
   }
 
