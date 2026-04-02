@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Preferences.h>
 #include <M5Unified.hpp>
 #include <NMEA2000.h>
 #include <N2kMessages.h>
@@ -11,9 +14,11 @@ constexpr uint32_t kSerialBaud = 115200;
 constexpr uint32_t kI2CFrequency = 100000;
 constexpr uint32_t kBootSettleMs = 500;
 constexpr uint32_t kSerialWaitMs = 15000;
-constexpr uint32_t kSamplePeriodMs = 500;
-constexpr uint32_t kSendPeriodMs = 1500;
-constexpr uint32_t kDisplayPeriodMs = 500;
+constexpr uint32_t kBatterySamplePeriodMs = 500;
+constexpr uint32_t kBatterySendPeriodMs = 1500;
+constexpr uint32_t kWindSendPeriodMs = 100;
+constexpr uint32_t kDisplayPeriodMs = 250;
+constexpr uint32_t kWindFreshMs = 3000;
 constexpr uint8_t kInaAddress = 0x41;
 constexpr uint8_t kInaRegConfig = 0x00;
 constexpr uint8_t kInaRegBusVoltage = 0x02;
@@ -24,11 +29,22 @@ constexpr uint16_t kInaManufacturerId = 0x5449;
 constexpr uint16_t kInaDieId = 0x2260;
 constexpr uint16_t kInaConfigValue = 0x4527;
 constexpr uint16_t kInaCalibrationValue = 0x0800;
+constexpr float kOffsetStepDeg = 1.0f;
+constexpr uint16_t kWindUdpPort = 20000;
+constexpr char kApSsid[] = "M5StampPLC-Wind";
+constexpr char kApPassword[] = "wind1234";
+constexpr char kPreferencesNamespace[] = "windcfg";
+constexpr char kPreferencesOffsetKey[] = "offset_deg";
 constexpr gpio_num_t kCanTxPin = GPIO_NUM_42;
 constexpr gpio_num_t kCanRxPin = GPIO_NUM_43;
+const IPAddress kApIp(192, 168, 4, 1);
+const IPAddress kApGateway(192, 168, 4, 1);
+const IPAddress kApSubnet(255, 255, 255, 0);
 
-TwoWire& externalBus = Wire;
-NMEA2000_esp32_twai NMEA2000(kCanTxPin, kCanRxPin);
+enum class DisplayMode : uint8_t {
+  Summary = 0,
+  Wind = 1,
+};
 
 struct BatteryChannel {
   const char* name;
@@ -40,6 +56,21 @@ struct BatteryChannel {
   uint8_t sid;
 };
 
+struct WindState {
+  bool valid;
+  float rawAngleDeg;
+  float offsetDeg;
+  uint8_t sid;
+  uint32_t lastPacketMs;
+  uint32_t packetCount;
+  IPAddress lastSenderIp;
+};
+
+TwoWire& externalBus = Wire;
+WiFiUDP windUdp;
+Preferences preferences;
+NMEA2000_esp32_twai NMEA2000(kCanTxPin, kCanRxPin);
+
 BatteryChannel batteries[] = {
     {"Port A", 2, 1, 0, false, NAN, 0},
     {"Port C", 5, 4, 1, false, NAN, 0},
@@ -47,79 +78,168 @@ BatteryChannel batteries[] = {
 
 constexpr size_t kBatteryCount = sizeof(batteries) / sizeof(batteries[0]);
 
-uint32_t lastSampleMs = 0;
-uint32_t lastSendMs = 0;
+WindState wind = {false, NAN, 0.0f, 0, 0, 0, IPAddress(0, 0, 0, 0)};
+DisplayMode displayMode = DisplayMode::Summary;
+
+uint32_t lastBatterySampleMs = 0;
+uint32_t lastBatterySendMs = 0;
+uint32_t lastWindSendMs = 0;
 uint32_t lastDisplayMs = 0;
 int activeSdaPin = -1;
 int activeSclPin = -1;
 
-const unsigned long kTransmitMessages[] PROGMEM = {127508L, 0};
+const unsigned long kTransmitMessages[] PROGMEM = {127508L, 130306L, 0};
 
 const tNMEA2000::tProductInformation kProductInformation PROGMEM = {
-    2100,
+    2101,
     100,
-    "M5StampPLC Battery Monitor",
-    "1.0.0",
-    "1.0.0",
-    "M5STAMPLC-BAT",
+    "M5StampPLC Batt+Wind",
+    "1.1.0",
+    "1.1.0",
+    "M5STAMPLC-BAT-WIND",
     1,
     1,
 };
 
 const char kManufacturerInformation[] PROGMEM = "Copilot0822";
-const char kInstallationDescription1[] PROGMEM = "Port A=Batt 0, Port C=Batt 1";
-const char kInstallationDescription2[] PROGMEM = "INA226 to NMEA2000 PGN 127508";
+const char kInstallationDescription1[] PROGMEM = "Batt A/C + WiFi AWA";
+const char kInstallationDescription2[] PROGMEM = "PGN 127508 + 130306";
 
-void updateDisplay() {
-  const int width = M5.Display.width();
-  const int height = M5.Display.height();
+float wrapDegrees(float degrees) {
+  while (degrees < 0.0f) {
+    degrees += 360.0f;
+  }
+  while (degrees >= 360.0f) {
+    degrees -= 360.0f;
+  }
+  return degrees;
+}
+
+bool windFresh(uint32_t now) {
+  return wind.valid && (now - wind.lastPacketMs <= kWindFreshMs);
+}
+
+float adjustedWindAngleDeg() {
+  if (!wind.valid || isnan(wind.rawAngleDeg)) {
+    return NAN;
+  }
+  return wrapDegrees(wind.rawAngleDeg + wind.offsetDeg);
+}
+
+String formatIp(const IPAddress& ip) {
+  return ip.toString();
+}
+
+void saveWindOffset() {
+  preferences.putFloat(kPreferencesOffsetKey, wind.offsetDeg);
+}
+
+void loadWindOffset() {
+  wind.offsetDeg = wrapDegrees(preferences.getFloat(kPreferencesOffsetKey, 0.0f));
+}
+
+void printLine(int x, int y, uint16_t color, const String& text) {
+  M5.Display.setCursor(x, y);
+  M5.Display.setTextColor(color, TFT_BLACK);
+  M5.Display.println(text);
+}
+
+void drawSummaryScreen(uint32_t now) {
   const int marginX = 8;
   const int marginY = 6;
-  const int headerHeight = 18;
-  const int footerHeight = 14;
-  const int contentTop = marginY + headerHeight + 4;
-  const int contentHeight = height - contentTop - footerHeight - marginY;
-  const int rowHeight = contentHeight / 2;
+  const int rowGap = 18;
+  const int footerY = M5.Display.height() - 14;
+  int y = marginY;
 
-  M5.Display.startWrite();
-  M5.Display.fillScreen(TFT_BLACK);
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.setTextFont(2);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextWrap(false);
-  M5.Display.setCursor(marginX, marginY);
-  M5.Display.println("Battery Monitor");
+  printLine(marginX, y, TFT_WHITE, "Battery + Wind");
+  y += rowGap;
 
   for (size_t i = 0; i < kBatteryCount; ++i) {
     const auto& battery = batteries[i];
-    const int rowTop = contentTop + static_cast<int>(i) * rowHeight;
-    const int valueY = rowTop + 16;
-    const int statusY = rowTop + 32;
-
-    M5.Display.drawFastHLine(0, rowTop - 3, width, TFT_DARKGREY);
-
-    M5.Display.setCursor(marginX, rowTop);
-    M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-    M5.Display.printf("%s  inst %u", battery.name, battery.instance);
-
-    M5.Display.setCursor(marginX, valueY);
+    String line = String(battery.instance) + " " + battery.name + " ";
     if (battery.present && !isnan(battery.voltage)) {
-      M5.Display.setTextColor(TFT_GREENYELLOW, TFT_BLACK);
-      M5.Display.printf("Voltage %.3f V", battery.voltage);
+      line += String(battery.voltage, 3) + "V";
+      printLine(marginX, y, i == 0 ? TFT_GREENYELLOW : TFT_CYAN, line);
     } else {
-      M5.Display.setTextColor(TFT_ORANGE, TFT_BLACK);
-      M5.Display.print("Voltage not found");
+      line += "NA";
+      printLine(marginX, y, TFT_ORANGE, line);
     }
-
-    M5.Display.setCursor(marginX, statusY);
-    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    M5.Display.printf("N2K instance %u", battery.instance);
+    y += rowGap;
   }
 
-  M5.Display.drawFastHLine(0, height - footerHeight - 2, width, TFT_DARKGREY);
-  M5.Display.setCursor(marginX, height - footerHeight);
-  M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  M5.Display.println("PGN 127508");
+  if (windFresh(now)) {
+    printLine(marginX, y, TFT_YELLOW, "AWA " + String(adjustedWindAngleDeg(), 1) + " deg");
+  } else {
+    printLine(marginX, y, TFT_ORANGE, "AWA waiting");
+  }
+  y += rowGap;
+
+  printLine(marginX, y, TFT_LIGHTGREY, "Off " + String(wind.offsetDeg, 1) + " deg");
+  y += rowGap;
+
+  const String wifiLine = "WiFi sta " + String(WiFi.softAPgetStationNum()) + " udp " + String(kWindUdpPort);
+  printLine(marginX, y, TFT_LIGHTGREY, wifiLine);
+
+  printLine(marginX, footerY, TFT_LIGHTGREY, "A+ B- C>");
+}
+
+void drawWindScreen(uint32_t now) {
+  const int marginX = 8;
+  const int marginY = 6;
+  const int rowGap = 18;
+  const int footerY = M5.Display.height() - 14;
+  int y = marginY;
+
+  printLine(marginX, y, TFT_WHITE, "Wind Detail");
+  y += rowGap;
+
+  if (wind.valid && !isnan(wind.rawAngleDeg)) {
+    printLine(marginX, y, TFT_CYAN, "Raw " + String(wind.rawAngleDeg, 1) + " deg");
+  } else {
+    printLine(marginX, y, TFT_ORANGE, "Raw waiting");
+  }
+  y += rowGap;
+
+  if (windFresh(now)) {
+    printLine(marginX, y, TFT_YELLOW, "Adj " + String(adjustedWindAngleDeg(), 1) + " deg");
+  } else {
+    printLine(marginX, y, TFT_ORANGE, "Adj stale");
+  }
+  y += rowGap;
+
+  printLine(marginX, y, TFT_GREENYELLOW, "Off " + String(wind.offsetDeg, 1) + " deg");
+  y += rowGap;
+
+  const uint32_t ageMs = wind.valid ? now - wind.lastPacketMs : 0;
+  printLine(marginX, y, TFT_LIGHTGREY, wind.valid ? "Age " + String(ageMs) + " ms" : "Age --");
+  y += rowGap;
+
+  if (wind.valid) {
+    printLine(marginX, y, TFT_LIGHTGREY, "Peer " + formatIp(wind.lastSenderIp));
+  } else {
+    printLine(marginX, y, TFT_LIGHTGREY, "Peer --");
+  }
+  y += rowGap;
+
+  printLine(marginX, y, TFT_LIGHTGREY, "Pkts " + String(wind.packetCount));
+  printLine(marginX, footerY, TFT_LIGHTGREY, "A+ B- C>");
+}
+
+void updateDisplay() {
+  const uint32_t now = millis();
+
+  M5.Display.startWrite();
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextFont(2);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextWrap(false);
+
+  if (displayMode == DisplayMode::Summary) {
+    drawSummaryScreen(now);
+  } else {
+    drawWindScreen(now);
+  }
+
   M5.Display.endWrite();
 }
 
@@ -159,8 +279,8 @@ void activateExternalBus(const BatteryChannel& battery) {
     return;
   }
 
-  // Rebinding the same hardware bus is required on this board. Without end(),
-  // the ESP32 Wire implementation can keep talking to the previous port pins.
+  // This board needs a full Wire shutdown before rebinding Port A vs Port C.
+  // Without end(), the ESP32 I2C driver can keep talking to the previous pins.
   recoverI2CBus(battery.sdaPin, battery.sclPin);
   delay(2);
   externalBus.end();
@@ -261,18 +381,94 @@ void sendBatteryStatus(BatteryChannel& battery) {
 
   SetN2kPGN127508(message, battery.instance, voltage, N2kDoubleNA, N2kDoubleNA, battery.sid++);
   NMEA2000.SendMsg(message);
-
-  Serial.printf("%s -> instance %u voltage=", battery.name, battery.instance);
-  if (battery.present && !isnan(battery.voltage)) {
-    Serial.printf("%.3f V\n", battery.voltage);
-  } else {
-    Serial.println("NA");
-  }
 }
 
 void sendBatteryStatuses() {
   for (auto& battery : batteries) {
     sendBatteryStatus(battery);
+  }
+}
+
+bool parseWindAnglePacket(const char* packet, float& angleDeg) {
+  if (packet == nullptr) {
+    return false;
+  }
+
+  const char* valueStart = strchr(packet, '=');
+  if (valueStart != nullptr) {
+    ++valueStart;
+  } else {
+    valueStart = packet;
+  }
+
+  char* end = nullptr;
+  const float parsed = strtof(valueStart, &end);
+  if (end == valueStart) {
+    return false;
+  }
+
+  angleDeg = wrapDegrees(parsed);
+  return true;
+}
+
+void receiveWindPackets() {
+  int packetSize = windUdp.parsePacket();
+
+  while (packetSize > 0) {
+    char buffer[64];
+    const int bytesRead = windUdp.read(buffer, sizeof(buffer) - 1);
+    if (bytesRead > 0) {
+      buffer[bytesRead] = '\0';
+
+      float angleDeg = NAN;
+      if (parseWindAnglePacket(buffer, angleDeg)) {
+        wind.valid = true;
+        wind.rawAngleDeg = angleDeg;
+        wind.lastPacketMs = millis();
+        wind.lastSenderIp = windUdp.remoteIP();
+        ++wind.packetCount;
+      }
+    }
+
+    packetSize = windUdp.parsePacket();
+  }
+}
+
+void sendWindStatus() {
+  tN2kMsg message;
+  const uint32_t now = millis();
+  const double windAngle = windFresh(now) ? adjustedWindAngleDeg() * M_PI / 180.0 : N2kDoubleNA;
+
+  SetN2kWindSpeed(message, wind.sid++, N2kDoubleNA, windAngle, N2kWind_Apparent);
+  NMEA2000.SendMsg(message);
+}
+
+void handleButtons() {
+  bool changed = false;
+
+  if (M5.BtnA.wasClicked()) {
+    wind.offsetDeg = wrapDegrees(wind.offsetDeg + kOffsetStepDeg);
+    saveWindOffset();
+    Serial.printf("Wind offset %.1f deg\n", wind.offsetDeg);
+    changed = true;
+  }
+
+  if (M5.BtnB.wasClicked()) {
+    wind.offsetDeg = wrapDegrees(wind.offsetDeg - kOffsetStepDeg);
+    saveWindOffset();
+    Serial.printf("Wind offset %.1f deg\n", wind.offsetDeg);
+    changed = true;
+  }
+
+  if (M5.BtnC.wasClicked()) {
+    displayMode = (displayMode == DisplayMode::Summary) ? DisplayMode::Wind : DisplayMode::Summary;
+    Serial.printf("Display mode %s\n", displayMode == DisplayMode::Summary ? "summary" : "wind");
+    changed = true;
+  }
+
+  if (changed) {
+    updateDisplay();
+    lastDisplayMs = millis();
   }
 }
 
@@ -317,7 +513,7 @@ void setupDisplay() {
   ioexp.setDirection(7, true);
   ioexp.setPullMode(7, false);
   ioexp.setHighImpedance(7, false);
-  ioexp.digitalWrite(7, false);  // StampPLC backlight is active low
+  ioexp.digitalWrite(7, false);
 
   if (M5.Display.width() < M5.Display.height()) {
     M5.Display.setRotation(M5.Display.getRotation() ^ 1);
@@ -327,6 +523,20 @@ void setupDisplay() {
   M5.Display.fillScreen(TFT_BLACK);
 }
 
+void setupWiFiAp() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+  WiFi.softAPdisconnect(true);
+  WiFi.softAPConfig(kApIp, kApGateway, kApSubnet);
+  WiFi.softAP(kApSsid, kApPassword);
+  windUdp.begin(kWindUdpPort);
+
+  Serial.printf("WiFi AP SSID: %s\n", kApSsid);
+  Serial.printf("WiFi AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("Wind UDP port: %u\n", kWindUdpPort);
+}
+
 }  // namespace
 
 void setup() {
@@ -334,30 +544,46 @@ void setup() {
   setupDisplay();
 
   Serial.println();
-  Serial.println("M5StampPLC dual INA226 battery monitor");
+  Serial.println("M5StampPLC battery and wind monitor");
+
+  preferences.begin(kPreferencesNamespace, false);
+  loadWindOffset();
 
   for (auto& battery : batteries) {
     initBattery(battery);
   }
 
+  setupWiFiAp();
   setupNmea2000();
   updateDisplay();
-  lastSampleMs = millis();
-  lastSendMs = millis();
-  lastDisplayMs = millis();
+
+  const uint32_t now = millis();
+  lastBatterySampleMs = now;
+  lastBatterySendMs = now;
+  lastWindSendMs = now;
+  lastDisplayMs = now;
 }
 
 void loop() {
   const uint32_t now = millis();
 
-  if (now - lastSampleMs >= kSamplePeriodMs) {
+  M5.update();
+  handleButtons();
+  receiveWindPackets();
+
+  if (now - lastBatterySampleMs >= kBatterySamplePeriodMs) {
     sampleBatteries();
-    lastSampleMs = now;
+    lastBatterySampleMs = now;
   }
 
-  if (now - lastSendMs >= kSendPeriodMs) {
+  if (now - lastBatterySendMs >= kBatterySendPeriodMs) {
     sendBatteryStatuses();
-    lastSendMs = now;
+    lastBatterySendMs = now;
+  }
+
+  if (now - lastWindSendMs >= kWindSendPeriodMs) {
+    sendWindStatus();
+    lastWindSendMs = now;
   }
 
   if (now - lastDisplayMs >= kDisplayPeriodMs) {
@@ -366,5 +592,4 @@ void loop() {
   }
 
   NMEA2000.ParseMessages();
-  M5.update();
 }
