@@ -1,25 +1,88 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
 namespace {
 
 constexpr uint32_t kSerialBaud = 115200;
+constexpr uint32_t kI2CFrequency = 400000;
 constexpr uint32_t kSendPeriodMs = 100;
 constexpr uint32_t kReconnectPeriodMs = 5000;
+constexpr uint32_t kSensorStatusPeriodMs = 5000;
 constexpr uint16_t kWindUdpPort = 20000;
+constexpr uint8_t kAs5600Address = 0x36;
+constexpr uint8_t kAs5600RegStatus = 0x0B;
+constexpr uint8_t kAs5600RegRawAngleHigh = 0x0C;
+constexpr uint8_t kAs5600MagnetDetectedMask = 0x20;
+constexpr uint16_t kAs5600CountsPerRev = 4096;
 constexpr char kApSsid[] = "M5StampPLC-Wind";
 constexpr char kApPassword[] = "wind1234";
 constexpr char kPacketPrefix[] = "angle=";
-constexpr float kPlaceholderAngleDeg = 45.0f;
 const IPAddress kPlcIp(192, 168, 4, 1);
 
 WiFiUDP windUdp;
 uint32_t lastSendMs = 0;
 uint32_t lastReconnectMs = 0;
+uint32_t lastSensorStatusMs = 0;
+bool sensorReady = false;
 
-float readPlaceholderAngleDeg() {
-  return kPlaceholderAngleDeg;
+bool readAs5600Register(uint8_t startRegister, uint8_t* buffer, size_t length) {
+  Wire.beginTransmission(kAs5600Address);
+  Wire.write(startRegister);
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  const size_t bytesRead = Wire.requestFrom(kAs5600Address, static_cast<uint8_t>(length));
+  if (bytesRead != length) {
+    while (Wire.available() > 0) {
+      Wire.read();
+    }
+    return false;
+  }
+
+  for (size_t i = 0; i < length; ++i) {
+    buffer[i] = Wire.read();
+  }
+
+  return true;
+}
+
+bool readAs5600AngleDeg(float& angleDeg) {
+  uint8_t status = 0;
+  if (!readAs5600Register(kAs5600RegStatus, &status, 1)) {
+    return false;
+  }
+  if ((status & kAs5600MagnetDetectedMask) == 0) {
+    return false;
+  }
+
+  uint8_t rawAngleBytes[2];
+  if (!readAs5600Register(kAs5600RegRawAngleHigh, rawAngleBytes, sizeof(rawAngleBytes))) {
+    return false;
+  }
+
+  const uint16_t rawAngle =
+      (static_cast<uint16_t>(rawAngleBytes[0]) << 8 | rawAngleBytes[1]) & 0x0FFF;
+  angleDeg = static_cast<float>(rawAngle) * (360.0f / kAs5600CountsPerRev);
+  return true;
+}
+
+void logSensorStatus(bool ready) {
+  const uint32_t now = millis();
+  if (ready == sensorReady && now - lastSensorStatusMs < kSensorStatusPeriodMs) {
+    return;
+  }
+
+  if (ready) {
+    Serial.printf("AS5600 ready on SDA=%u SCL=%u\n", SDA, SCL);
+  } else {
+    Serial.println("AS5600 not detected or magnet missing");
+  }
+
+  sensorReady = ready;
+  lastSensorStatusMs = now;
 }
 
 void connectToPlcAp() {
@@ -59,7 +122,13 @@ void ensureWiFiConnected() {
 }
 
 void sendWindPacket() {
-  const float angleDeg = readPlaceholderAngleDeg();
+  float angleDeg = 0.0f;
+  if (!readAs5600AngleDeg(angleDeg)) {
+    logSensorStatus(false);
+    return;
+  }
+
+  logSensorStatus(true);
   char payload[32];
   snprintf(payload, sizeof(payload), "%s%.2f", kPacketPrefix, angleDeg);
 
@@ -77,6 +146,7 @@ void setup() {
   delay(500);
   Serial.println();
   Serial.println("ESP32 WiFi wind sender");
+  Wire.begin(SDA, SCL, kI2CFrequency);
   connectToPlcAp();
 }
 
