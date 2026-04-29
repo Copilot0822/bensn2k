@@ -4,6 +4,7 @@
 #include <WiFiUdp.h>
 #include <Preferences.h>
 #include <M5Unified.hpp>
+#include <M5StamPLC.h>
 #include <NMEA2000.h>
 #include <N2kMessages.h>
 #include <NMEA2000_esp32_twai.h>
@@ -35,6 +36,8 @@ constexpr char kApSsid[] = "M5StampPLC-Wind";
 constexpr char kApPassword[] = "wind1234";
 constexpr char kPreferencesNamespace[] = "windcfg";
 constexpr char kPreferencesOffsetKey[] = "offset_deg";
+constexpr uint8_t kPlcRelay1Channel = 0;
+constexpr uint8_t kPlcRelay2Channel = 1;
 constexpr gpio_num_t kCanTxPin = GPIO_NUM_42;
 constexpr gpio_num_t kCanRxPin = GPIO_NUM_43;
 const IPAddress kApIp(192, 168, 4, 1);
@@ -70,6 +73,7 @@ TwoWire& externalBus = Wire;
 WiFiUDP windUdp;
 Preferences preferences;
 NMEA2000_esp32_twai NMEA2000(kCanTxPin, kCanRxPin);
+AW9523_Class plcIoExpander;
 
 BatteryChannel batteries[] = {
     {"Port A", 2, 1, 0, false, NAN, 0},
@@ -537,6 +541,29 @@ void setupWiFiAp() {
   Serial.printf("Wind UDP port: %u\n", kWindUdpPort);
 }
 
+void setupPlcRelays() {
+  if (!plcIoExpander.begin()) {
+    Serial.println("PLC relay expander not found");
+    return;
+  }
+
+  plcIoExpander.configureDirection(0x0000);
+  plcIoExpander.openDrainPort0(false);
+  plcIoExpander.interruptEnableGPIO(0x0000);
+
+  for (uint8_t channel = 0; channel < 4; ++channel) {
+    plcIoExpander.pinMode(channel, AW9523_Class::AW_OUTPUT);
+    plcIoExpander.digitalWrite(channel, false);
+  }
+
+  plcIoExpander.disableIrq();
+  plcIoExpander.digitalWrite(kPlcRelay1Channel, true);
+  plcIoExpander.digitalWrite(kPlcRelay2Channel, true);
+
+  Serial.println("PLC relay 1 ON");
+  Serial.println("PLC relay 2 ON");
+}
+
 }  // namespace
 
 void setup() {
@@ -553,6 +580,7 @@ void setup() {
     initBattery(battery);
   }
 
+  setupPlcRelays();
   setupWiFiAp();
   setupNmea2000();
   updateDisplay();
