@@ -75,6 +75,7 @@ WiFiUDP windUdp;
 Preferences preferences;
 NMEA2000_esp32_twai NMEA2000(kCanTxPin, kCanRxPin);
 AW9523_Class plcIoExpander;
+char apSsid[32] = {};
 
 BatteryChannel batteries[] = {
     {"Port A", 2, 1, 0, false, NAN, 0},
@@ -91,6 +92,7 @@ uint32_t lastBatterySampleMs = 0;
 uint32_t lastBatterySendMs = 0;
 uint32_t lastWindSendMs = 0;
 uint32_t lastDisplayMs = 0;
+uint32_t lastCanStatusMs = 0;
 int activeSdaPin = -1;
 int activeSclPin = -1;
 
@@ -512,6 +514,28 @@ void setupNmea2000() {
   }
 }
 
+void logCanStatus() {
+  if (!canBusEnabled) {
+    Serial.println("CAN status: disabled");
+    return;
+  }
+
+  twai_status_info_t status = {};
+  if (twai_get_status_info(&status) != ESP_OK) {
+    Serial.println("CAN status: unavailable");
+    return;
+  }
+
+  Serial.printf(
+      "CAN status: state=%d tx_err=%lu rx_err=%lu txq=%lu rxq=%lu bus_err=%lu\n",
+      static_cast<int>(status.state),
+      static_cast<unsigned long>(status.tx_error_counter),
+      static_cast<unsigned long>(status.rx_error_counter),
+      static_cast<unsigned long>(status.msgs_to_tx),
+      static_cast<unsigned long>(status.msgs_to_rx),
+      static_cast<unsigned long>(status.bus_error_count));
+}
+
 void setupSerial() {
   Serial.begin(kSerialBaud);
   const uint32_t serialWaitStart = millis();
@@ -523,7 +547,7 @@ void setupSerial() {
 
 void setupDisplay() {
   auto cfg = M5.config();
-  cfg.serial_baudrate = 0;
+  cfg.serial_baudrate = kSerialBaud;
   cfg.external_rtc = false;
   cfg.external_imu = false;
   cfg.internal_rtc = false;
@@ -548,15 +572,17 @@ void setupDisplay() {
 }
 
 void setupWiFiAp() {
+  snprintf(apSsid, sizeof(apSsid), "%s-%s", kApSsid, canBusEnabled ? "CANOK" : "CANFAIL");
+
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
   WiFi.setSleep(false);
   WiFi.softAPdisconnect(true);
   WiFi.softAPConfig(kApIp, kApGateway, kApSubnet);
-  WiFi.softAP(kApSsid, kApPassword);
+  WiFi.softAP(apSsid, kApPassword);
   windUdp.begin(kWindUdpPort);
 
-  Serial.printf("WiFi AP SSID: %s\n", kApSsid);
+  Serial.printf("WiFi AP SSID: %s\n", apSsid);
   Serial.printf("WiFi AP IP: %s\n", WiFi.softAPIP().toString().c_str());
   Serial.printf("Wind UDP port: %u\n", kWindUdpPort);
 }
@@ -601,8 +627,8 @@ void setup() {
   }
 
   setupPlcRelays();
-  setupWiFiAp();
   setupNmea2000();
+  setupWiFiAp();
   updateDisplay();
 
   const uint32_t now = millis();
@@ -637,6 +663,11 @@ void loop() {
   if (now - lastDisplayMs >= kDisplayPeriodMs) {
     updateDisplay();
     lastDisplayMs = now;
+  }
+
+  if (now - lastCanStatusMs >= 5000) {
+    logCanStatus();
+    lastCanStatusMs = now;
   }
 
   if (canBusEnabled) {
