@@ -38,8 +38,9 @@ constexpr char kPreferencesNamespace[] = "windcfg";
 constexpr char kPreferencesOffsetKey[] = "offset_deg";
 constexpr uint8_t kPlcRelay1Channel = 0;
 constexpr uint8_t kPlcRelay2Channel = 1;
-constexpr gpio_num_t kCanTxPin = GPIO_NUM_42;
-constexpr gpio_num_t kCanRxPin = GPIO_NUM_43;
+constexpr gpio_num_t kCanTxPin = static_cast<gpio_num_t>(STAMPLC_PIN_CAN_TX);
+constexpr gpio_num_t kCanRxPin = static_cast<gpio_num_t>(STAMPLC_PIN_CAN_RX);
+constexpr uint32_t kCanBaudRate = 250000;
 const IPAddress kApIp(192, 168, 4, 1);
 const IPAddress kApGateway(192, 168, 4, 1);
 const IPAddress kApSubnet(255, 255, 255, 0);
@@ -84,6 +85,7 @@ constexpr size_t kBatteryCount = sizeof(batteries) / sizeof(batteries[0]);
 
 WindState wind = {false, NAN, 0.0f, 0, 0, 0, IPAddress(0, 0, 0, 0)};
 DisplayMode displayMode = DisplayMode::Summary;
+bool canBusEnabled = false;
 
 uint32_t lastBatterySampleMs = 0;
 uint32_t lastBatterySendMs = 0;
@@ -388,6 +390,10 @@ void sendBatteryStatus(BatteryChannel& battery) {
 }
 
 void sendBatteryStatuses() {
+  if (!canBusEnabled) {
+    return;
+  }
+
   for (auto& battery : batteries) {
     sendBatteryStatus(battery);
   }
@@ -439,6 +445,10 @@ void receiveWindPackets() {
 }
 
 void sendWindStatus() {
+  if (!canBusEnabled) {
+    return;
+  }
+
   tN2kMsg message;
   const uint32_t now = millis();
   const double windAngle = windFresh(now) ? adjustedWindAngleDeg() * M_PI / 180.0 : N2kDoubleNA;
@@ -489,7 +499,17 @@ void setupNmea2000() {
       2046);
   NMEA2000.SetMode(tNMEA2000::N2km_ListenAndNode, 22);
   NMEA2000.ExtendTransmitMessages(kTransmitMessages);
-  NMEA2000.Open();
+  canBusEnabled = NMEA2000.Open();
+
+  if (canBusEnabled) {
+    Serial.printf(
+        "PWR-CAN enabled on GPIO%d/GPIO%d at %lu bps\n",
+        static_cast<int>(kCanTxPin),
+        static_cast<int>(kCanRxPin),
+        static_cast<unsigned long>(kCanBaudRate));
+  } else {
+    Serial.println("Failed to enable PWR-CAN");
+  }
 }
 
 void setupSerial() {
@@ -619,5 +639,7 @@ void loop() {
     lastDisplayMs = now;
   }
 
-  NMEA2000.ParseMessages();
+  if (canBusEnabled) {
+    NMEA2000.ParseMessages();
+  }
 }
