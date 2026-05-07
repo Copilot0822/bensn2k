@@ -6,20 +6,27 @@
 namespace {
 
 constexpr uint32_t kSerialBaud = 115200;
-constexpr uint32_t kI2CFrequency = 400000;
+constexpr uint32_t kSerialWaitMs = 3000;
+constexpr uint32_t kI2CFrequency = 100000;
 constexpr uint32_t kSendPeriodMs = 100;
 constexpr uint32_t kReconnectPeriodMs = 5000;
 constexpr uint32_t kSensorStatusPeriodMs = 5000;
+constexpr uint32_t kWifiConnectTimeoutMs = 15000;
 constexpr uint16_t kWindUdpPort = 20000;
 constexpr uint8_t kAs5600Address = 0x36;
 constexpr uint8_t kAs5600RegStatus = 0x0B;
 constexpr uint8_t kAs5600RegRawAngleHigh = 0x0C;
 constexpr uint8_t kAs5600MagnetDetectedMask = 0x20;
 constexpr uint16_t kAs5600CountsPerRev = 4096;
-constexpr char kApSsid[] = "M5StampPLC-Wind";
+constexpr uint8_t kSdaPin = D4;  // XIAO ESP32C3 D4 = GPIO6
+constexpr uint8_t kSclPin = D5;  // XIAO ESP32C3 D5 = GPIO7
+constexpr char kApSsidBase[] = "M5StampPLC-Wind";
+constexpr char kApSsidCanOk[] = "M5StampPLC-Wind-CANOK";
+constexpr char kApSsidCanFail[] = "M5StampPLC-Wind-CANFAIL";
 constexpr char kApPassword[] = "wind1234";
 constexpr char kPacketPrefix[] = "angle=";
 const IPAddress kPlcIp(192, 168, 4, 1);
+const char* const kApCandidates[] = {kApSsidCanOk, kApSsidCanFail, kApSsidBase};
 
 WiFiUDP windUdp;
 uint32_t lastSendMs = 0;
@@ -76,7 +83,7 @@ void logSensorStatus(bool ready) {
   }
 
   if (ready) {
-    Serial.printf("AS5600 ready on SDA=%u SCL=%u\n", SDA, SCL);
+    Serial.printf("AS5600 ready on D4/GPIO%u D5/GPIO%u\n", kSdaPin, kSclPin);
   } else {
     Serial.println("AS5600 not detected or magnet missing");
   }
@@ -88,20 +95,27 @@ void logSensorStatus(bool ready) {
 void connectToPlcAp() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.begin(kApSsid, kApPassword);
+  for (const char* ssid : kApCandidates) {
+    WiFi.disconnect(true, true);
+    delay(100);
+    WiFi.begin(ssid, kApPassword);
 
-  Serial.printf("Connecting to %s", kApSsid);
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(250);
-    Serial.print(".");
+    Serial.printf("Connecting to %s", ssid);
+    const uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < kWifiConnectTimeoutMs) {
+      delay(250);
+      Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("Connected to %s, IP %s\n", ssid, WiFi.localIP().toString().c_str());
+      return;
+    }
   }
-  Serial.println();
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("Connected, IP %s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("WiFi connect timed out");
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connect timed out on all PLC SSIDs");
   }
 }
 
@@ -121,14 +135,18 @@ void ensureWiFiConnected() {
   connectToPlcAp();
 }
 
-void sendWindPacket() {
-  float angleDeg = 0.0f;
+bool sampleEncoderAngle(float& angleDeg) {
   if (!readAs5600AngleDeg(angleDeg)) {
     logSensorStatus(false);
-    return;
+    return false;
   }
 
   logSensorStatus(true);
+  Serial.printf("Encoder angle %.2f deg\n", angleDeg);
+  return true;
+}
+
+void sendWindPacket(float angleDeg) {
   char payload[32];
   snprintf(payload, sizeof(payload), "%s%.2f", kPacketPrefix, angleDeg);
 
@@ -143,24 +161,30 @@ void sendWindPacket() {
 
 void setup() {
   Serial.begin(kSerialBaud);
-  delay(500);
+  const uint32_t serialStartMs = millis();
+  while (!Serial && millis() - serialStartMs < kSerialWaitMs) {
+    delay(10);
+  }
+  delay(200);
   Serial.println();
-  Serial.println("ESP32 WiFi wind sender");
-  Wire.begin(SDA, SCL, kI2CFrequency);
+  Serial.println("XIAO ESP32C3 WiFi wind sender");
+  Wire.begin(kSdaPin, kSclPin, kI2CFrequency);
+  Serial.printf("I2C started on D4/GPIO%u D5/GPIO%u at %lu Hz\n", kSdaPin, kSclPin,
+                kI2CFrequency);
   connectToPlcAp();
 }
 
 void loop() {
   ensureWiFiConnected();
 
-  if (WiFi.status() != WL_CONNECTED) {
-    delay(10);
-    return;
-  }
-
   const uint32_t now = millis();
   if (now - lastSendMs >= kSendPeriodMs) {
-    sendWindPacket();
+    float angleDeg = 0.0f;
+    if (sampleEncoderAngle(angleDeg) && WiFi.status() == WL_CONNECTED) {
+      sendWindPacket(angleDeg);
+    }
     lastSendMs = now;
   }
+
+  delay(10);
 }
