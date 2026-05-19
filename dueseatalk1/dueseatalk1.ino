@@ -15,6 +15,12 @@
 //   BTN:TACK_PORT
 //   BTN:TACK_STBD
 //
+// PLC serial bridge:
+//   Arduino Due Serial2 RX2 pin 17 <- M5Stamp PLC G41 / TX
+//   Arduino Due Serial2 TX2 pin 16 -> M5Stamp PLC G40 / RX
+//   Common GND required
+//   Protocol is the same line protocol as USB serial.
+//
 // SeaTalk hardware:
 //   Due TX1 pin 18 -> SN74LS07 -> SeaTalk DATA
 //   SeaTalk DATA -> PC817 non-inverting RX -> Due RX1 pin 19
@@ -41,6 +47,7 @@
 #define RX_IDLE_IS_HIGH 1
 
 #define SEATALK_BAUD 4800
+#define CONTROL_BAUD 115200
 
 // Dedicated digital input used only for idle checking.
 const int SEATALK_IDLE_SENSE_PIN = 22;
@@ -50,9 +57,10 @@ const int SEATALK_IDLE_SENSE_PIN = 22;
 const uint8_t ST_KEY_SOURCE = 0x11;
 
 // SeaTalk idle wait before transmit.
-// 10 bit-times at 4800 baud ≈ 2.08 ms. Use 2.5 ms.
+// 10 bit-times at 4800 baud is about 2.08 ms. Use 2.5 ms.
 const uint32_t SEATALK_IDLE_US = 2500;
 const uint32_t SEATALK_TX_TIMEOUT_MS = 300;
+const uint32_t STATUS_PRINT_MS = 1000;
 
 
 // ===================== FORWARD DECLARATIONS =====================
@@ -60,6 +68,7 @@ const uint32_t SEATALK_TX_TIMEOUT_MS = 300;
 void setupUSART0_9bit_TXRX();
 
 void serviceUSBSerial();
+void servicePlcSerial();
 void serviceSeaTalkRX();
 
 bool read9NonBlocking(uint16_t &value);
@@ -79,6 +88,9 @@ void sendKeyDatagram(uint8_t keyCode);
 void handleButtonCommand(const char *cmd);
 void trimLine(char *s);
 void handleUSBLine(char *line);
+void handlePlcLine(char *line);
+void handleControlLine(char *line, Print &reply);
+void printIdleStatus(Print &out);
 
 void handleSeaTalkWord(uint16_t word);
 void processSeaTalkDatagram(const uint8_t *d, uint8_t len);
@@ -100,6 +112,8 @@ void printHex2(uint8_t b);
 
 char usbLine[96];
 uint8_t usbLineLen = 0;
+char plcLine[96];
+uint8_t plcLineLen = 0;
 
 
 // ===================== SEATALK DATAGRAM PARSER =====================
@@ -223,14 +237,19 @@ bool seaTalkBusIdle() {
 
 void debugIdlePin() {
 #if DEBUG_IDLE_PIN
+  printIdleStatus(Serial);
+#endif
+}
+
+
+void printIdleStatus(Print &out) {
   bool pinHigh = rawSeaTalkIdleSenseHigh();
   bool idle = seaTalkBusIdle();
 
-  Serial.print("IDLE_DEBUG:SENSE_PIN_22=");
-  Serial.print(pinHigh ? "HIGH" : "LOW");
-  Serial.print(";BUS_IDLE=");
-  Serial.println(idle ? "YES" : "NO");
-#endif
+  out.print("IDLE_DEBUG:SENSE_PIN_22=");
+  out.print(pinHigh ? "HIGH" : "LOW");
+  out.print(";BUS_IDLE=");
+  out.println(idle ? "YES" : "NO");
 }
 
 
@@ -409,6 +428,16 @@ void trimLine(char *s) {
 
 
 void handleUSBLine(char *line) {
+  handleControlLine(line, Serial);
+}
+
+
+void handlePlcLine(char *line) {
+  handleControlLine(line, Serial2);
+}
+
+
+void handleControlLine(char *line, Print &reply) {
   trimLine(line);
 
   if (line[0] == '\0') {
@@ -416,12 +445,12 @@ void handleUSBLine(char *line) {
   }
 
   if (strcmp(line, "HELLO") == 0) {
-    Serial.println("ACK:HELLO");
+    reply.println("ACK:HELLO");
     return;
   }
 
   if (strcmp(line, "IDLE?") == 0) {
-    debugIdlePin();
+    printIdleStatus(reply);
     return;
   }
 
@@ -449,6 +478,26 @@ void serviceUSBSerial() {
       } else {
         usbLineLen = 0;
         Serial.println("ERR:USB_LINE_TOO_LONG");
+      }
+    }
+  }
+}
+
+
+void servicePlcSerial() {
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+
+    if (c == '\n') {
+      plcLine[plcLineLen] = '\0';
+      handlePlcLine(plcLine);
+      plcLineLen = 0;
+    } else if (c != '\r') {
+      if (plcLineLen < sizeof(plcLine) - 1) {
+        plcLine[plcLineLen++] = c;
+      } else {
+        plcLineLen = 0;
+        Serial2.println("ERR:PLC_LINE_TOO_LONG");
       }
     }
   }
@@ -546,11 +595,18 @@ void processSeaTalkDatagram(const uint8_t *d, uint8_t len) {
 
 void printRawSeaTalkDatagram(const uint8_t *d, uint8_t len) {
   Serial.print("ST_RX:");
+  Serial2.print("ST_RX:");
   for (uint8_t i = 0; i < len; i++) {
     Serial.print(" ");
     printHex2(d[i]);
+    Serial2.print(" ");
+    if (d[i] < 0x10) {
+      Serial2.print("0");
+    }
+    Serial2.print(d[i], HEX);
   }
   Serial.println();
+  Serial2.println();
 }
 
 
@@ -616,6 +672,8 @@ void parseWindAngle10(const uint8_t *d, uint8_t len) {
 
   Serial.print("WIND_ANGLE:");
   Serial.println(windAngle, 1);
+  Serial2.print("WIND_ANGLE:");
+  Serial2.println(windAngle, 1);
 }
 
 
@@ -688,6 +746,13 @@ void printStatusLine() {
   Serial.print(lastRudder, 1);
   Serial.print(";SETPOINT=");
   Serial.println(lastSetpoint, 0);
+
+  Serial2.print("STATUS:MODE=");
+  Serial2.print(lastMode);
+  Serial2.print(";RUDDER=");
+  Serial2.print(lastRudder, 1);
+  Serial2.print(";SETPOINT=");
+  Serial2.println(lastSetpoint, 0);
 }
 
 
@@ -705,7 +770,8 @@ void printHex2(uint8_t b) {
 // ===================== ARDUINO SETUP/LOOP =====================
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(CONTROL_BAUD);
+  Serial2.begin(CONTROL_BAUD);
 
   uint32_t start = millis();
   while (!Serial && millis() - start < 3000) {
@@ -717,7 +783,7 @@ void setup() {
 
   Serial.println();
   Serial.println("Due SeaTalk 1 controller starting");
-  Serial.println("USB protocol: BTN:<COMMAND>");
+  Serial.println("USB/PLC protocol: BTN:<COMMAND>");
   Serial.println("GUI status: STATUS:MODE=<MODE>;RUDDER=<deg>;SETPOINT=<deg>");
   Serial.println("Idle check uses dedicated sense pin 22.");
   Serial.println("Wire pin 22 to the 3.3V RX node, same node as Due RX1 pin 19.");
@@ -743,6 +809,7 @@ void setup() {
 
 void loop() {
   serviceUSBSerial();
+  servicePlcSerial();
   serviceSeaTalkRX();
 
 #if DEBUG_IDLE_PIN
@@ -753,7 +820,7 @@ void loop() {
 #endif
 
   // Heartbeat status for GUI.
-  if (millis() - lastStatusPrintMs > 3000) {
+  if (millis() - lastStatusPrintMs > STATUS_PRINT_MS) {
     lastStatusPrintMs = millis();
     printStatusLine();
   }

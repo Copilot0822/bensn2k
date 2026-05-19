@@ -21,17 +21,17 @@ http://127.0.0.1:5173/
 npm run build
 ```
 
-The ESP32 can serve the generated `dist/` directory once the firmware file-serving path is wired in.
+The M5Stamp PLC firmware serves the generated files from its SPIFFS filesystem.
 
-For the current generic ESP32 test sketch, the built files are staged in:
+After building, stage the files for the PLC filesystem image:
 
 ```txt
-../ESP32DashboardTest/data/
+../NEWM5Stam/data/
 ```
 
 ## Current behavior
 
-- Uses mock marine data shaped like the planned `GET /data` response.
+- Uses mock marine data shaped like the PLC `GET /data` response.
 - Polls `GET /data` when hosted on the ESP32 and falls back to browser mock data during PC development.
 - Saves page names, page count, widget visibility, widget order, and widget sizes in `localStorage`.
 - Saves the pilot control unlock state in `localStorage`.

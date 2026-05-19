@@ -2,7 +2,7 @@
 
 `bensn2k` is a work-in-progress marine electronics repository. It currently contains three Arduino sketches and one React dashboard:
 
-- `NEWM5Stam/`: M5Stamp PLC firmware that samples battery voltage, receives wind angle packets over Wi-Fi UDP, displays status locally, and transmits selected values onto NMEA 2000.
+- `NEWM5Stam/`: M5Stamp PLC firmware that samples battery voltage, receives wind angle packets over Wi-Fi UDP, communicates with the Arduino Due over serial, serves the dashboard from SPIFFS, exposes the dashboard HTTP API, displays status locally, and transmits selected values onto NMEA 2000.
 - `WindWifiSenderESP32/`: XIAO ESP32C3 firmware that reads an AS5600 magnetic angle sensor and sends apparent wind angle packets to the M5Stamp PLC over Wi-Fi.
 - `dueseatalk1/`: Arduino Due firmware that talks to a Raymarine SeaTalk 1 bus using 9-bit serial, receives and decodes SeaTalk datagrams, and can transmit autopilot keypress datagrams from USB serial commands.
 - `marine-dashboard/`: a Vite/React browser dashboard for marine telemetry, layoutable widgets, and autopilot controls. It currently runs with mock data unless a firmware or server endpoint provides the expected HTTP API.
@@ -54,7 +54,7 @@ Arduino Due running dueseatalk1
 Raymarine SeaTalk 1 bus / autopilot control head
 ```
 
-The React dashboard is designed around a future ESP32 or local HTTP bridge. Its UI already polls `GET /data` and posts autopilot commands to `POST /api/autopilot`, but none of the current Arduino sketches in this repo implement those HTTP endpoints yet.
+The React dashboard is now staged for the M5Stamp PLC SPIFFS filesystem. The PLC firmware serves the built files, implements `GET /data`, and forwards `POST /api/autopilot` commands to the Due as SeaTalk button commands.
 
 ## Repository layout
 
@@ -62,6 +62,8 @@ The React dashboard is designed around a future ESP32 or local HTTP bridge. Its 
 .
 |-- NEWM5Stam/
 |   |-- NEWM5Stam.ino
+|   |-- data/
+|   |   `-- Dashboard static files for SPIFFS upload
 |   `-- build/esp32.esp32.m5stack_stamp_s3/
 |       `-- Arduino build output and binaries
 |-- WindWifiSenderESP32/
@@ -87,12 +89,15 @@ Notes:
 
 ### M5Stamp PLC firmware: `NEWM5Stam`
 
-`NEWM5Stam/NEWM5Stam.ino` is the hub of the current NMEA 2000 side. It runs on an M5Stamp PLC / Stamp S3 target and does four main jobs:
+`NEWM5Stam/NEWM5Stam.ino` is the hub of the current NMEA 2000, Wi-Fi, web, and SeaTalk bridge side. It runs on an M5Stamp PLC / Stamp S3 target and does these jobs:
 
 1. Reads two INA226 voltage monitors.
 2. Receives apparent wind angle from the remote ESP32 wind sender over Wi-Fi UDP.
-3. Shows battery and wind status on the M5 display.
-4. Publishes battery status and apparent wind angle to NMEA 2000 over the ESP32 TWAI/CAN peripheral.
+3. Talks to the Arduino Due over UART on PLC pins G40/G41.
+4. Serves the dashboard from SPIFFS over the PLC Wi-Fi access point.
+5. Provides `GET /data` and `POST /api/autopilot` for the dashboard.
+6. Shows battery and wind status on the M5 display.
+7. Publishes battery status and apparent wind angle to NMEA 2000 over the ESP32 TWAI/CAN peripheral.
 
 Important constants and behavior:
 
@@ -107,6 +112,10 @@ Important constants and behavior:
 - AP IP/gateway: `192.168.4.1`.
 - AP subnet: `255.255.255.0`.
 - UDP wind port: `20000`.
+- HTTP port: `80`.
+- Due serial bridge: `115200 baud`, `SERIAL_8N1`.
+- PLC G40: RX from Due TX2 pin `16`.
+- PLC G41: TX to Due RX2 pin `17`.
 - Wind packet freshness window: `3000 ms`.
 - Wind transmit period to NMEA 2000: `100 ms`.
 - Battery sample period: `500 ms`.
@@ -226,6 +235,8 @@ The M5Stamp PLC normally advertises one of the first two, depending on CAN state
 
 `dueseatalk1/dueseatalk1.ino` runs on an Arduino Due and implements a SeaTalk 1 controller interface using the SAM3X USART0 in 9-bit mode. It can listen to the bus, decode a few known datagrams, and transmit Raymarine-style keypress datagrams when commanded over USB serial.
 
+The sketch now also listens on `Serial2` for the M5Stamp PLC. USB serial remains available for debugging and bench commands.
+
 Important constants and behavior:
 
 - USB serial baud: `115200`.
@@ -246,13 +257,15 @@ Hardware wiring described by the sketch:
 | TX1 pin `18` / PA11 / TXD0 | SeaTalk transmit through SN74LS07 to SeaTalk DATA |
 | RX1 pin `19` / PA10 / RXD0 | SeaTalk receive through non-inverting PC817 receiver |
 | Digital pin `22` | Dedicated idle sense input wired to the same 3.3 V RX node |
+| TX2 pin `16` | PLC serial TX to M5Stamp PLC G40 / RX |
+| RX2 pin `17` | PLC serial RX from M5Stamp PLC G41 / TX |
 
 Expected polarity:
 
 - SeaTalk bus high means Due RX1 pin `19` high and idle sense pin `22` high.
 - SeaTalk bus low means Due RX1 pin `19` low and idle sense pin `22` low.
 
-USB serial commands:
+USB and PLC serial commands:
 
 | Command | Behavior |
 | --- | --- |
@@ -326,7 +339,7 @@ Modes are decoded from the low bits of the `0x84` datagram:
 
 ## React dashboard
 
-`marine-dashboard/` is a Vite React app named `marine-dashboard`. It is currently a static frontend project with mock-data fallback behavior.
+`marine-dashboard/` is a Vite React app named `marine-dashboard`. It is a static frontend project with mock-data fallback behavior during desktop development. The current production build is staged in `NEWM5Stam/data/` so the M5Stamp PLC can serve it from SPIFFS.
 
 Main files:
 
@@ -495,32 +508,18 @@ Both are browser `localStorage` keys.
 
 ## Current integration status
 
-This repo has several useful pieces, but it is not yet a single fully wired product.
-
 What is wired in source today:
 
 - The wind sender can join the M5Stamp PLC access point and send AS5600 angles over UDP.
 - The M5Stamp PLC can receive those UDP packets, apply a persisted offset, show the value, and publish apparent wind angle to NMEA 2000.
 - The M5Stamp PLC can sample two INA226 voltage monitors and publish battery voltage to NMEA 2000.
 - The Arduino Due can listen to and transmit SeaTalk 1 datagrams through external interface hardware.
-- The React dashboard can run locally, display mock marine data, persist layout changes, and issue HTTP autopilot command requests.
-
-What is not wired in source today:
-
-- `NEWM5Stam` does not serve the React dashboard static files.
-- `NEWM5Stam` does not implement `GET /data`.
-- `NEWM5Stam` does not implement `POST /api/autopilot`.
-- `dueseatalk1` is not connected to the dashboard code.
-- There is no bridge in this repo that maps dashboard `POST /api/autopilot` commands to Arduino Due USB serial commands like `BTN:AUTO`.
-- There is no code in this repo that converts SeaTalk 1 status output from the Due into the dashboard's `seatalkStatus`, `rudderAngle`, `targetHeading`, or debug arrays.
-- The dashboard mentions staging built files into `../ESP32DashboardTest/data/`, but that target project is not present in this repository.
-
-A likely next integration step would be an HTTP bridge that:
-
-1. Serves the dashboard build output.
-2. Provides `GET /data` using current NMEA 2000, Wi-Fi, battery, and SeaTalk state.
-3. Provides `POST /api/autopilot`.
-4. Converts dashboard command names to the Due serial protocol:
+- The Due accepts the same command protocol on USB serial and `Serial2`.
+- The Due mirrors raw SeaTalk datagrams, decoded wind angle, and autopilot status to the PLC over `Serial2`.
+- The M5Stamp PLC serves the staged dashboard files from SPIFFS.
+- The M5Stamp PLC implements `GET /data` using battery, wind, NMEA 2000 status, Wi-Fi, and Due/SeaTalk bridge state.
+- The M5Stamp PLC decodes incoming NMEA 2000 PGNs for heading, COG/SOG, boat speed, water depth, and water temperature.
+- The M5Stamp PLC implements `POST /api/autopilot` and converts dashboard commands to Due button commands:
 
 ```txt
 standby        -> BTN:STBY
@@ -534,6 +533,11 @@ heading_delta 10  -> BTN:P10
 tack_port      -> BTN:TACK_PORT
 tack_starboard -> BTN:TACK_STBD
 ```
+
+Still not fully implemented:
+
+- The PLC does not verify actual SeaTalk TX success from the Due before returning `202` from `POST /api/autopilot`; it confirms that the command was accepted for serial forwarding.
+- Static dashboard files must be uploaded to the M5Stamp PLC SPIFFS partition separately from the firmware upload.
 
 ## Build and upload notes
 
@@ -607,6 +611,14 @@ base: './'
 ```
 
 That makes the built assets more suitable for being served from an embedded filesystem or a subdirectory, because references are relative instead of rooted at `/`.
+
+After building the dashboard, stage the files for the PLC SPIFFS image:
+
+```sh
+cp -r marine-dashboard/dist/* NEWM5Stam/data/
+```
+
+Then upload the sketch and upload the filesystem image using your ESP32 Arduino filesystem upload workflow. The existing partition table includes a SPIFFS partition, and the current dashboard payload is about 234 KB.
 
 ## Protocol details
 
@@ -738,4 +750,3 @@ For the dashboard:
 4. Confirm mock data updates once per second.
 5. Open `Layout`, add/remove/resize widgets, and refresh to confirm layout persistence.
 6. Unlock controls and test command button UI in development mode. Failed HTTP posts are expected without a backend.
-

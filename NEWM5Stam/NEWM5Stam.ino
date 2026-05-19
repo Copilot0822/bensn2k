@@ -2,6 +2,8 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
 #include <Preferences.h>
 #include <M5Unified.hpp>
 #include <M5StamPLC.h>
@@ -20,6 +22,14 @@ constexpr uint32_t kBatterySendPeriodMs = 1500;
 constexpr uint32_t kWindSendPeriodMs = 100;
 constexpr uint32_t kDisplayPeriodMs = 250;
 constexpr uint32_t kWindFreshMs = 3000;
+constexpr uint32_t kN2kFreshMs = 5000;
+constexpr uint32_t kSeatalkFreshMs = 3000;
+constexpr uint32_t kDueHelloPeriodMs = 2000;
+constexpr uint32_t kDueSerialBaud = 115200;
+constexpr uint8_t kDueRxPin = 40;  // M5Stamp PLC G40: receive from Due TX2 pin 16
+constexpr uint8_t kDueTxPin = 41;  // M5Stamp PLC G41: transmit to Due RX2 pin 17
+constexpr size_t kDueLineMax = 160;
+constexpr size_t kDebugLineCount = 8;
 constexpr uint8_t kInaAddress = 0x41;
 constexpr uint8_t kInaRegConfig = 0x00;
 constexpr uint8_t kInaRegBusVoltage = 0x02;
@@ -70,12 +80,46 @@ struct WindState {
   IPAddress lastSenderIp;
 };
 
+struct SeatalkState {
+  bool dueConnected;
+  bool statusValid;
+  char mode[16];
+  float rudderAngleDeg;
+  float targetHeadingDeg;
+  float compassHeadingDeg;
+  float windAngleDeg;
+  uint32_t dueLastSeenMs;
+  uint32_t lastSeenMs;
+  uint32_t rawPacketCount;
+  uint32_t decodedPacketCount;
+  uint32_t errorCount;
+};
+
+struct N2kRxState {
+  float headingDeg;
+  float cogDeg;
+  float sogKn;
+  float depthM;
+  float waterTempC;
+  uint32_t headingLastMs;
+  uint32_t cogSogLastMs;
+  uint32_t speedLastMs;
+  uint32_t depthLastMs;
+  uint32_t waterTempLastMs;
+  uint32_t lastRxMs;
+  uint32_t rxPacketCount;
+};
+
 TwoWire& externalBus = Wire;
 WiFiUDP windUdp;
+WebServer webServer(80);
+HardwareSerial dueSerial(1);
 Preferences preferences;
 NMEA2000_esp32_twai NMEA2000(kCanTxPin, kCanRxPin);
 AW9523_Class plcIoExpander;
 char apSsid[32] = {};
+char dueLine[kDueLineMax] = {};
+size_t dueLineLen = 0;
 
 BatteryChannel batteries[] = {
     {"Port A", 2, 1, 0, false, NAN, 0},
@@ -85,18 +129,35 @@ BatteryChannel batteries[] = {
 constexpr size_t kBatteryCount = sizeof(batteries) / sizeof(batteries[0]);
 
 WindState wind = {false, NAN, 0.0f, 0, 0, 0, IPAddress(0, 0, 0, 0)};
+SeatalkState seatalk = {false, false, "--", NAN, NAN, NAN, NAN, 0, 0, 0, 0, 0};
+N2kRxState n2kRx = {NAN, NAN, NAN, NAN, NAN, 0, 0, 0, 0, 0, 0, 0};
 DisplayMode displayMode = DisplayMode::Summary;
 bool canBusEnabled = false;
 
+String rawSeatalkLines[kDebugLineCount];
+String decodedSeatalkLines[kDebugLineCount];
+String rawN2kLines[kDebugLineCount];
 uint32_t lastBatterySampleMs = 0;
 uint32_t lastBatterySendMs = 0;
 uint32_t lastWindSendMs = 0;
 uint32_t lastDisplayMs = 0;
 uint32_t lastCanStatusMs = 0;
+uint32_t lastDueHelloMs = 0;
+uint32_t n2kPacketCount = 0;
 int activeSdaPin = -1;
 int activeSclPin = -1;
 
 const unsigned long kTransmitMessages[] PROGMEM = {127508L, 130306L, 0};
+const unsigned long kReceiveMessages[] PROGMEM = {
+    127250L,  // Vessel heading
+    128259L,  // Boat speed
+    128267L,  // Water depth
+    129026L,  // COG/SOG rapid
+    130310L,  // Outside environmental parameters
+    130311L,  // Environmental parameters
+    130312L,  // Temperature
+    130316L,  // Temperature extended range
+    0};
 
 const tNMEA2000::tProductInformation kProductInformation PROGMEM = {
     2101,
@@ -136,6 +197,105 @@ float adjustedWindAngleDeg() {
 
 String formatIp(const IPAddress& ip) {
   return ip.toString();
+}
+
+bool seatalkFresh(uint32_t now) {
+  return seatalk.statusValid && (now - seatalk.lastSeenMs <= kSeatalkFreshMs);
+}
+
+bool dueFresh(uint32_t now) {
+  return seatalk.dueConnected && (now - seatalk.dueLastSeenMs <= (kDueHelloPeriodMs * 3));
+}
+
+bool valueFresh(uint32_t now, uint32_t lastMs, uint32_t freshMs = kN2kFreshMs) {
+  return lastMs != 0 && (now - lastMs <= freshMs);
+}
+
+float freshOrNan(float value, uint32_t now, uint32_t lastMs, uint32_t freshMs = kN2kFreshMs) {
+  return valueFresh(now, lastMs, freshMs) ? value : NAN;
+}
+
+float n2kDoubleToFloatOrNan(double value) {
+  return N2kIsNA(value) ? NAN : static_cast<float>(value);
+}
+
+float radiansToDegreesOrNan(double radians) {
+  return N2kIsNA(radians) ? NAN : wrapDegrees(static_cast<float>(radians * 180.0 / M_PI));
+}
+
+float metersPerSecondToKnotsOrNan(double metersPerSecond) {
+  return N2kIsNA(metersPerSecond) ? NAN : static_cast<float>(metersPerSecond * 1.9438444924406);
+}
+
+float kelvinToCelsiusOrNan(double kelvin) {
+  return N2kIsNA(kelvin) ? NAN : static_cast<float>(kelvin - 273.15);
+}
+
+void rememberLine(String lines[], const String& line) {
+  for (size_t i = kDebugLineCount - 1; i > 0; --i) {
+    lines[i] = lines[i - 1];
+  }
+  lines[0] = line;
+}
+
+String jsonEscape(const String& value) {
+  String escaped;
+  escaped.reserve(value.length() + 8);
+
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = value[i];
+    if (c == '"' || c == '\\') {
+      escaped += '\\';
+      escaped += c;
+    } else if (c == '\n') {
+      escaped += "\\n";
+    } else if (c == '\r') {
+      escaped += "\\r";
+    } else {
+      escaped += c;
+    }
+  }
+
+  return escaped;
+}
+
+void appendJsonString(String& json, const String& key, const String& value) {
+  json += "\"";
+  json += key;
+  json += "\":\"";
+  json += jsonEscape(value);
+  json += "\"";
+}
+
+void appendJsonNumberOrNull(String& json, const String& key, float value, uint8_t precision) {
+  json += "\"";
+  json += key;
+  json += "\":";
+  if (isnan(value)) {
+    json += "null";
+  } else {
+    json += String(value, static_cast<unsigned int>(precision));
+  }
+}
+
+void appendJsonLineArray(String& json, const String& key, const String lines[]) {
+  json += "\"";
+  json += key;
+  json += "\":[";
+  bool first = true;
+  for (size_t i = 0; i < kDebugLineCount; ++i) {
+    if (lines[i].isEmpty()) {
+      continue;
+    }
+    if (!first) {
+      json += ",";
+    }
+    json += "\"";
+    json += jsonEscape(lines[i]);
+    json += "\"";
+    first = false;
+  }
+  json += "]";
 }
 
 void saveWindOffset() {
@@ -389,6 +549,7 @@ void sendBatteryStatus(BatteryChannel& battery) {
 
   SetN2kPGN127508(message, battery.instance, voltage, N2kDoubleNA, N2kDoubleNA, battery.sid++);
   NMEA2000.SendMsg(message);
+  ++n2kPacketCount;
 }
 
 void sendBatteryStatuses() {
@@ -446,6 +607,122 @@ void receiveWindPackets() {
   }
 }
 
+bool parseFloatField(const char* line, const char* key, float& value) {
+  const char* start = strstr(line, key);
+  if (start == nullptr) {
+    return false;
+  }
+
+  start += strlen(key);
+  char* end = nullptr;
+  const float parsed = strtof(start, &end);
+  if (end == start) {
+    return false;
+  }
+
+  value = parsed;
+  return true;
+}
+
+bool parseTextField(const char* line, const char* key, char* output, size_t outputSize) {
+  const char* start = strstr(line, key);
+  if (start == nullptr || outputSize == 0) {
+    return false;
+  }
+
+  start += strlen(key);
+  const char* end = strchr(start, ';');
+  const size_t length = end == nullptr ? strlen(start) : static_cast<size_t>(end - start);
+  const size_t copyLength = min(length, outputSize - 1);
+  memcpy(output, start, copyLength);
+  output[copyLength] = '\0';
+  return true;
+}
+
+void processDueLine(const char* line) {
+  if (line == nullptr || line[0] == '\0') {
+    return;
+  }
+
+  const uint32_t now = millis();
+  seatalk.dueConnected = true;
+  seatalk.dueLastSeenMs = now;
+
+  if (strncmp(line, "STATUS:", 7) == 0) {
+    parseTextField(line, "MODE=", seatalk.mode, sizeof(seatalk.mode));
+    parseFloatField(line, "RUDDER=", seatalk.rudderAngleDeg);
+    parseFloatField(line, "SETPOINT=", seatalk.targetHeadingDeg);
+    seatalk.statusValid = true;
+    seatalk.lastSeenMs = now;
+    ++seatalk.decodedPacketCount;
+    rememberLine(decodedSeatalkLines, String(line));
+    return;
+  }
+
+  if (strncmp(line, "INFO:COMPASS=", 13) == 0) {
+    seatalk.compassHeadingDeg = wrapDegrees(strtof(line + 13, nullptr));
+    ++seatalk.decodedPacketCount;
+    rememberLine(decodedSeatalkLines, String(line));
+    return;
+  }
+
+  if (strncmp(line, "WIND_ANGLE:", 11) == 0) {
+    seatalk.windAngleDeg = wrapDegrees(strtof(line + 11, nullptr));
+    seatalk.lastSeenMs = now;
+    ++seatalk.decodedPacketCount;
+    rememberLine(decodedSeatalkLines, String(line));
+    return;
+  }
+
+  if (strncmp(line, "ST_RX:", 6) == 0) {
+    seatalk.lastSeenMs = now;
+    ++seatalk.rawPacketCount;
+    rememberLine(rawSeatalkLines, String(line + 6));
+    return;
+  }
+
+  if (strncmp(line, "ERR:", 4) == 0 || strstr(line, "ERROR") != nullptr) {
+    ++seatalk.errorCount;
+    rememberLine(decodedSeatalkLines, String(line));
+    return;
+  }
+
+  if (strncmp(line, "ACK:", 4) == 0 || strncmp(line, "TX_OK", 5) == 0) {
+    rememberLine(decodedSeatalkLines, String(line));
+  }
+}
+
+void serviceDueSerial() {
+  while (dueSerial.available() > 0) {
+    const char c = static_cast<char>(dueSerial.read());
+
+    if (c == '\n') {
+      dueLine[dueLineLen] = '\0';
+      processDueLine(dueLine);
+      dueLineLen = 0;
+    } else if (c != '\r') {
+      if (dueLineLen < sizeof(dueLine) - 1) {
+        dueLine[dueLineLen++] = c;
+      } else {
+        dueLineLen = 0;
+        ++seatalk.errorCount;
+      }
+    }
+  }
+
+  const uint32_t now = millis();
+  if (now - lastDueHelloMs >= kDueHelloPeriodMs) {
+    dueSerial.println("HELLO");
+    lastDueHelloMs = now;
+  }
+}
+
+void sendDueButtonCommand(const char* buttonCommand) {
+  dueSerial.print("BTN:");
+  dueSerial.println(buttonCommand);
+  Serial.printf("Due command BTN:%s\n", buttonCommand);
+}
+
 void sendWindStatus() {
   if (!canBusEnabled) {
     return;
@@ -457,6 +734,7 @@ void sendWindStatus() {
 
   SetN2kWindSpeed(message, wind.sid++, N2kDoubleNA, windAngle, N2kWind_Apparent);
   NMEA2000.SendMsg(message);
+  ++n2kPacketCount;
 }
 
 void handleButtons() {
@@ -488,6 +766,177 @@ void handleButtons() {
   }
 }
 
+void rememberN2kLine(const char* label, float value, const char* unit) {
+  String line = label;
+  line += " ";
+  if (isnan(value)) {
+    line += "NA";
+  } else {
+    line += String(value, 2);
+    if (unit != nullptr && unit[0] != '\0') {
+      line += unit;
+    }
+  }
+  rememberLine(rawN2kLines, line);
+}
+
+void handleN2kHeading(const tN2kMsg& message, uint32_t now) {
+  unsigned char sid = 0;
+  tN2kHeadingReference reference;
+  double heading = N2kDoubleNA;
+  double deviation = N2kDoubleNA;
+  double variation = N2kDoubleNA;
+
+  if (ParseN2kHeading(message, sid, heading, deviation, variation, reference)) {
+    n2kRx.headingDeg = radiansToDegreesOrNan(heading);
+    n2kRx.headingLastMs = now;
+    rememberN2kLine("127250 heading", n2kRx.headingDeg, "deg");
+  }
+}
+
+void handleN2kBoatSpeed(const tN2kMsg& message, uint32_t now) {
+  unsigned char sid = 0;
+  double sow = N2kDoubleNA;
+  double sog = N2kDoubleNA;
+  tN2kSpeedWaterReferenceType referenceType;
+
+  if (ParseN2kBoatSpeed(message, sid, sow, sog, referenceType)) {
+    const float sogKn = metersPerSecondToKnotsOrNan(sog);
+    const float sowKn = metersPerSecondToKnotsOrNan(sow);
+    n2kRx.sogKn = isnan(sogKn) ? sowKn : sogKn;
+    n2kRx.speedLastMs = now;
+    rememberN2kLine("128259 speed", n2kRx.sogKn, "kt");
+  }
+}
+
+void handleN2kWaterDepth(const tN2kMsg& message, uint32_t now) {
+  unsigned char sid = 0;
+  double depthBelowTransducer = N2kDoubleNA;
+  double offset = N2kDoubleNA;
+
+  if (ParseN2kWaterDepth(message, sid, depthBelowTransducer, offset)) {
+    if (N2kIsNA(depthBelowTransducer)) {
+      n2kRx.depthM = NAN;
+    } else {
+      n2kRx.depthM = static_cast<float>(
+          depthBelowTransducer + (N2kIsNA(offset) ? 0.0 : offset));
+    }
+    n2kRx.depthLastMs = now;
+    rememberN2kLine("128267 depth", n2kRx.depthM, "m");
+  }
+}
+
+void handleN2kCogSog(const tN2kMsg& message, uint32_t now) {
+  unsigned char sid = 0;
+  tN2kHeadingReference headingReference;
+  double cog = N2kDoubleNA;
+  double sog = N2kDoubleNA;
+
+  if (ParseN2kCOGSOGRapid(message, sid, headingReference, cog, sog)) {
+    n2kRx.cogDeg = radiansToDegreesOrNan(cog);
+    n2kRx.sogKn = metersPerSecondToKnotsOrNan(sog);
+    n2kRx.cogSogLastMs = now;
+    rememberN2kLine("129026 COG", n2kRx.cogDeg, "deg");
+    rememberN2kLine("129026 SOG", n2kRx.sogKn, "kt");
+  }
+}
+
+void updateN2kWaterTemperature(double temperature, uint32_t now, const char* label) {
+  n2kRx.waterTempC = kelvinToCelsiusOrNan(temperature);
+  if (!isnan(n2kRx.waterTempC)) {
+    n2kRx.waterTempLastMs = now;
+    rememberN2kLine(label, n2kRx.waterTempC, "C");
+  }
+}
+
+void handleN2kOutsideEnvironmental(const tN2kMsg& message, uint32_t now) {
+  unsigned char sid = 0;
+  double waterTemperature = N2kDoubleNA;
+  double outsideAmbientAirTemperature = N2kDoubleNA;
+  double atmosphericPressure = N2kDoubleNA;
+
+  if (ParseN2kOutsideEnvironmentalParameters(
+          message, sid, waterTemperature, outsideAmbientAirTemperature, atmosphericPressure)) {
+    updateN2kWaterTemperature(waterTemperature, now, "130310 water temp");
+  }
+}
+
+void handleN2kEnvironmental(const tN2kMsg& message, uint32_t now) {
+  unsigned char sid = 0;
+  tN2kTempSource tempSource;
+  double temperature = N2kDoubleNA;
+  tN2kHumiditySource humiditySource;
+  double humidity = N2kDoubleNA;
+  double atmosphericPressure = N2kDoubleNA;
+
+  if (ParseN2kEnvironmentalParameters(
+          message, sid, tempSource, temperature, humiditySource, humidity, atmosphericPressure)
+      && tempSource == N2kts_SeaTemperature) {
+    updateN2kWaterTemperature(temperature, now, "130311 water temp");
+  }
+}
+
+void handleN2kTemperature(const tN2kMsg& message, uint32_t now) {
+  unsigned char sid = 0;
+  unsigned char tempInstance = 0;
+  tN2kTempSource tempSource;
+  double actualTemperature = N2kDoubleNA;
+  double setTemperature = N2kDoubleNA;
+
+  if (ParseN2kTemperature(message, sid, tempInstance, tempSource, actualTemperature, setTemperature)
+      && tempSource == N2kts_SeaTemperature) {
+    updateN2kWaterTemperature(actualTemperature, now, "130312 water temp");
+  }
+}
+
+void handleN2kTemperatureExt(const tN2kMsg& message, uint32_t now) {
+  unsigned char sid = 0;
+  unsigned char tempInstance = 0;
+  tN2kTempSource tempSource;
+  double actualTemperature = N2kDoubleNA;
+  double setTemperature = N2kDoubleNA;
+
+  if (ParseN2kTemperatureExt(message, sid, tempInstance, tempSource, actualTemperature, setTemperature)
+      && tempSource == N2kts_SeaTemperature) {
+    updateN2kWaterTemperature(actualTemperature, now, "130316 water temp");
+  }
+}
+
+void handleNmea2000Message(const tN2kMsg& message) {
+  const uint32_t now = millis();
+  n2kRx.lastRxMs = now;
+  ++n2kRx.rxPacketCount;
+
+  switch (message.PGN) {
+    case 127250L:
+      handleN2kHeading(message, now);
+      break;
+    case 128259L:
+      handleN2kBoatSpeed(message, now);
+      break;
+    case 128267L:
+      handleN2kWaterDepth(message, now);
+      break;
+    case 129026L:
+      handleN2kCogSog(message, now);
+      break;
+    case 130310L:
+      handleN2kOutsideEnvironmental(message, now);
+      break;
+    case 130311L:
+      handleN2kEnvironmental(message, now);
+      break;
+    case 130312L:
+      handleN2kTemperature(message, now);
+      break;
+    case 130316L:
+      handleN2kTemperatureExt(message, now);
+      break;
+    default:
+      break;
+  }
+}
+
 void setupNmea2000() {
   NMEA2000.SetProductInformation(&kProductInformation);
   NMEA2000.SetProgmemConfigurationInformation(
@@ -501,6 +950,8 @@ void setupNmea2000() {
       2046);
   NMEA2000.SetMode(tNMEA2000::N2km_ListenAndNode, 22);
   NMEA2000.ExtendTransmitMessages(kTransmitMessages);
+  NMEA2000.ExtendReceiveMessages(kReceiveMessages);
+  NMEA2000.SetMsgHandler(handleNmea2000Message);
   canBusEnabled = NMEA2000.Open();
 
   if (canBusEnabled) {
@@ -536,6 +987,240 @@ void logCanStatus() {
       static_cast<unsigned long>(status.bus_error_count));
 }
 
+String contentTypeForPath(const String& path) {
+  if (path.endsWith(".html")) {
+    return "text/html";
+  }
+  if (path.endsWith(".css")) {
+    return "text/css";
+  }
+  if (path.endsWith(".js")) {
+    return "application/javascript";
+  }
+  if (path.endsWith(".svg")) {
+    return "image/svg+xml";
+  }
+  if (path.endsWith(".png")) {
+    return "image/png";
+  }
+  if (path.endsWith(".ico")) {
+    return "image/x-icon";
+  }
+  if (path.endsWith(".json")) {
+    return "application/json";
+  }
+  return "application/octet-stream";
+}
+
+bool serveFileFromSpiffs(String path) {
+  if (path.endsWith("/")) {
+    path += "index.html";
+  }
+
+  if (!SPIFFS.exists(path)) {
+    if (path.indexOf('.') < 0 && SPIFFS.exists("/index.html")) {
+      path = "/index.html";
+    } else {
+      return false;
+    }
+  }
+
+  File file = SPIFFS.open(path, "r");
+  if (!file) {
+    return false;
+  }
+
+  webServer.streamFile(file, contentTypeForPath(path));
+  file.close();
+  return true;
+}
+
+String buildDataJson() {
+  const uint32_t now = millis();
+  const bool windIsFresh = windFresh(now);
+  const bool seatalkIsFresh = seatalkFresh(now);
+  const bool dueIsFresh = dueFresh(now);
+  const uint32_t seatalkAgeMs = seatalk.lastSeenMs == 0 ? 0xFFFFFFFFUL : now - seatalk.lastSeenMs;
+  const uint32_t n2kAgeMs = n2kRx.lastRxMs == 0 ? 0xFFFFFFFFUL : now - n2kRx.lastRxMs;
+  const float headingDeg = valueFresh(now, n2kRx.headingLastMs)
+      ? n2kRx.headingDeg
+      : (seatalkIsFresh ? seatalk.compassHeadingDeg : NAN);
+  const float sogKn = valueFresh(now, n2kRx.cogSogLastMs)
+      ? n2kRx.sogKn
+      : freshOrNan(n2kRx.sogKn, now, n2kRx.speedLastMs);
+
+  String json;
+  json.reserve(1800);
+  json += "{";
+  appendJsonNumberOrNull(json, "heading", headingDeg, 0);
+  json += ",";
+  appendJsonNumberOrNull(json, "cog", freshOrNan(n2kRx.cogDeg, now, n2kRx.cogSogLastMs), 0);
+  json += ",";
+  appendJsonNumberOrNull(json, "sog", sogKn, 1);
+  json += ",";
+  appendJsonNumberOrNull(json, "awa", windIsFresh ? adjustedWindAngleDeg() : NAN, 0);
+  json += ",";
+  appendJsonNumberOrNull(json, "depth", freshOrNan(n2kRx.depthM, now, n2kRx.depthLastMs), 1);
+  json += ",";
+  appendJsonNumberOrNull(json, "waterTemp", freshOrNan(n2kRx.waterTempC, now, n2kRx.waterTempLastMs), 1);
+  json += ",";
+  appendJsonNumberOrNull(json, "rudderAngle", seatalkIsFresh ? seatalk.rudderAngleDeg : NAN, 0);
+  json += ",";
+  appendJsonNumberOrNull(json, "battery0", batteries[0].present ? batteries[0].voltage : NAN, 2);
+  json += ",";
+  appendJsonNumberOrNull(json, "battery1", batteries[1].present ? batteries[1].voltage : NAN, 2);
+  json += ",";
+  appendJsonString(json, "autopilotMode", seatalkIsFresh ? String(seatalk.mode) : String("--"));
+  json += ",";
+  appendJsonNumberOrNull(json, "targetHeading", seatalkIsFresh ? seatalk.targetHeadingDeg : NAN, 0);
+  json += ",";
+  appendJsonString(json, "seatalkStatus", seatalkIsFresh ? "ok" : (dueIsFresh ? "stale" : "missing"));
+  json += ",";
+  appendJsonString(json, "n2kStatus", canBusEnabled && valueFresh(now, n2kRx.lastRxMs, kN2kFreshMs) ? "ok" : "warn");
+  json += ",\"seatalkLastSeenMs\":";
+  json += String(seatalkAgeMs);
+  json += ",\"n2kLastSeenMs\":";
+  json += String(n2kAgeMs);
+  json += ",\"wifiClients\":";
+  json += String(WiFi.softAPgetStationNum());
+  json += ",\"uptime\":";
+  json += String(now);
+  json += ",\"packetCounters\":{";
+  json += "\"seatalkRaw\":";
+  json += String(seatalk.rawPacketCount);
+  json += ",\"seatalkDecoded\":";
+  json += String(seatalk.decodedPacketCount);
+  json += ",\"n2kPgn\":";
+  json += String(n2kPacketCount + n2kRx.rxPacketCount);
+  json += ",\"errors\":";
+  json += String(seatalk.errorCount);
+  json += "},";
+  appendJsonLineArray(json, "rawSeatalk", rawSeatalkLines);
+  json += ",";
+  appendJsonLineArray(json, "decodedSeatalk", decodedSeatalkLines);
+  json += ",";
+  appendJsonLineArray(json, "rawN2k", rawN2kLines);
+  json += "}";
+  return json;
+}
+
+String extractJsonStringField(const String& body, const String& key) {
+  const String quotedKey = "\"" + key + "\"";
+  int keyIndex = body.indexOf(quotedKey);
+  if (keyIndex < 0) {
+    return "";
+  }
+
+  int colonIndex = body.indexOf(':', keyIndex + quotedKey.length());
+  if (colonIndex < 0) {
+    return "";
+  }
+
+  int firstQuote = body.indexOf('"', colonIndex + 1);
+  if (firstQuote < 0) {
+    return "";
+  }
+
+  int secondQuote = body.indexOf('"', firstQuote + 1);
+  if (secondQuote < 0) {
+    return "";
+  }
+
+  return body.substring(firstQuote + 1, secondQuote);
+}
+
+bool extractJsonNumberField(const String& body, const String& key, float& value) {
+  const String quotedKey = "\"" + key + "\"";
+  int keyIndex = body.indexOf(quotedKey);
+  if (keyIndex < 0) {
+    return false;
+  }
+
+  int colonIndex = body.indexOf(':', keyIndex + quotedKey.length());
+  if (colonIndex < 0) {
+    return false;
+  }
+
+  const char* start = body.c_str() + colonIndex + 1;
+  char* end = nullptr;
+  value = strtof(start, &end);
+  return end != start;
+}
+
+const char* mapAutopilotCommand(const String& command, const String& body) {
+  if (command == "standby") {
+    return "STBY";
+  }
+  if (command == "auto") {
+    return "AUTO";
+  }
+  if (command == "wind") {
+    return "WIND";
+  }
+  if (command == "track") {
+    return "TRACK";
+  }
+  if (command == "tack_port") {
+    return "TACK_PORT";
+  }
+  if (command == "tack_starboard") {
+    return "TACK_STBD";
+  }
+  if (command == "heading_delta") {
+    float value = 0.0f;
+    if (!extractJsonNumberField(body, "value", value)) {
+      return nullptr;
+    }
+    const int delta = static_cast<int>(roundf(value));
+    if (delta == -10) {
+      return "M10";
+    }
+    if (delta == -1) {
+      return "M1";
+    }
+    if (delta == 1) {
+      return "P1";
+    }
+    if (delta == 10) {
+      return "P10";
+    }
+  }
+
+  return nullptr;
+}
+
+void handleDataRequest() {
+  webServer.send(200, "application/json", buildDataJson());
+}
+
+void handleAutopilotRequest() {
+  const String body = webServer.arg("plain");
+  const String command = extractJsonStringField(body, "command");
+  const char* dueCommand = mapAutopilotCommand(command, body);
+
+  if (dueCommand == nullptr) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"unsupported_command\"}");
+    return;
+  }
+
+  const bool isStandby = strcmp(dueCommand, "STBY") == 0;
+  if (!isStandby && !seatalkFresh(millis())) {
+    webServer.send(409, "application/json", "{\"ok\":false,\"error\":\"seatalk_stale\"}");
+    return;
+  }
+
+  sendDueButtonCommand(dueCommand);
+  webServer.send(202, "application/json", "{\"ok\":true}");
+}
+
+void handleNotFound() {
+  if (serveFileFromSpiffs(webServer.uri())) {
+    return;
+  }
+
+  webServer.send(404, "text/plain", "Not found");
+}
+
 void setupSerial() {
   Serial.begin(kSerialBaud);
   const uint32_t serialWaitStart = millis();
@@ -543,6 +1228,15 @@ void setupSerial() {
     delay(10);
   }
   delay(kBootSettleMs);
+}
+
+void setupDueSerial() {
+  dueSerial.begin(kDueSerialBaud, SERIAL_8N1, kDueRxPin, kDueTxPin);
+  Serial.printf(
+      "Due serial bridge on PLC G%u/RX and G%u/TX at %lu baud\n",
+      kDueRxPin,
+      kDueTxPin,
+      static_cast<unsigned long>(kDueSerialBaud));
 }
 
 void setupDisplay() {
@@ -587,6 +1281,23 @@ void setupWiFiAp() {
   Serial.printf("Wind UDP port: %u\n", kWindUdpPort);
 }
 
+void setupWebServer() {
+  if (!SPIFFS.begin(false)) {
+    Serial.println("SPIFFS mount failed; dashboard files unavailable");
+  } else {
+    Serial.printf("SPIFFS mounted: %lu/%lu bytes used\n",
+                  static_cast<unsigned long>(SPIFFS.usedBytes()),
+                  static_cast<unsigned long>(SPIFFS.totalBytes()));
+  }
+
+  webServer.on("/data", HTTP_GET, handleDataRequest);
+  webServer.on("/api/autopilot", HTTP_POST, handleAutopilotRequest);
+  webServer.onNotFound(handleNotFound);
+  webServer.begin();
+
+  Serial.println("HTTP server started on port 80");
+}
+
 void setupPlcRelays() {
   if (!plcIoExpander.begin()) {
     Serial.println("PLC relay expander not found");
@@ -614,6 +1325,7 @@ void setupPlcRelays() {
 
 void setup() {
   setupSerial();
+  setupDueSerial();
   setupDisplay();
 
   Serial.println();
@@ -629,6 +1341,7 @@ void setup() {
   setupPlcRelays();
   setupNmea2000();
   setupWiFiAp();
+  setupWebServer();
   updateDisplay();
 
   const uint32_t now = millis();
@@ -644,6 +1357,8 @@ void loop() {
   M5.update();
   handleButtons();
   receiveWindPackets();
+  serviceDueSerial();
+  webServer.handleClient();
 
   if (now - lastBatterySampleMs >= kBatterySamplePeriodMs) {
     sampleBatteries();
