@@ -24,6 +24,7 @@ constexpr uint32_t kDisplayPeriodMs = 250;
 constexpr uint32_t kWindFreshMs = 3000;
 constexpr uint32_t kN2kFreshMs = 5000;
 constexpr uint32_t kSeatalkFreshMs = 3000;
+constexpr double kApparentWindSpeedMetersPerSecond = 8.0 * 0.5144444444444445;
 constexpr uint32_t kDueHelloPeriodMs = 2000;
 constexpr uint32_t kDueSerialBaud = 115200;
 constexpr uint8_t kDueRxPin = 40;  // M5Stamp PLC G40: receive from Due TX2 pin 16
@@ -687,8 +688,11 @@ void processDueLine(const char* line) {
     return;
   }
 
-  if (strncmp(line, "ACK:", 4) == 0 || strncmp(line, "TX_OK", 5) == 0) {
+  if (strncmp(line, "ACK:", 4) == 0 || strncmp(line, "BUTTON:", 7) == 0 ||
+      strncmp(line, "ST_TX:", 6) == 0 || strncmp(line, "TX_OK", 5) == 0 ||
+      strncmp(line, "WOULD_TX:", 9) == 0) {
     rememberLine(decodedSeatalkLines, String(line));
+    return;
   }
 }
 
@@ -718,6 +722,7 @@ void serviceDueSerial() {
 }
 
 void sendDueButtonCommand(const char* buttonCommand) {
+  rememberLine(decodedSeatalkLines, String("M5_TX:BTN:") + buttonCommand);
   dueSerial.print("BTN:");
   dueSerial.println(buttonCommand);
   Serial.printf("Due command BTN:%s\n", buttonCommand);
@@ -732,7 +737,7 @@ void sendWindStatus() {
   const uint32_t now = millis();
   const double windAngle = windFresh(now) ? adjustedWindAngleDeg() * M_PI / 180.0 : N2kDoubleNA;
 
-  SetN2kWindSpeed(message, wind.sid++, N2kDoubleNA, windAngle, N2kWind_Apparent);
+  SetN2kWindSpeed(message, wind.sid++, kApparentWindSpeedMetersPerSecond, windAngle, N2kWind_Apparent);
   NMEA2000.SendMsg(message);
   ++n2kPacketCount;
 }

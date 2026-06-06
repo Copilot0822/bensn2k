@@ -105,6 +105,11 @@ float headingFineCorrection(uint8_t U);
 float normalize360(float deg);
 
 void printStatusLine();
+void printTxDatagram(Print &out, const uint8_t *bytes, uint8_t len);
+void printBusNotIdleError(Print &out);
+void printNoEchoError(Print &out, uint16_t value);
+void printEchoMismatchError(Print &out, uint16_t value, uint16_t echo);
+void printHex2To(Print &out, uint8_t b);
 void printHex2(uint8_t b);
 
 
@@ -277,10 +282,8 @@ bool waitForSeaTalkIdle(uint32_t idleUs, uint32_t timeoutMs) {
     }
   }
 
-  Serial.print("ERR:BUS_NOT_IDLE;SENSE_PIN_22=");
-  Serial.print(rawSeaTalkIdleSenseHigh() ? "HIGH" : "LOW");
-  Serial.print(";BUS_IDLE=");
-  Serial.println(seaTalkBusIdle() ? "YES" : "NO");
+  printBusNotIdleError(Serial);
+  printBusNotIdleError(Serial2);
 
   return false;
 }
@@ -294,16 +297,14 @@ bool send9WithEchoCheck(uint16_t value) {
   uint16_t echo = 0;
 
   if (!read9EchoBlocking(echo, 30)) {
-    Serial.print("ERR:NO_ECHO TX=0x");
-    Serial.println(value, HEX);
+    printNoEchoError(Serial, value);
+    printNoEchoError(Serial2, value);
     return false;
   }
 
   if ((echo & 0x01FF) != (value & 0x01FF)) {
-    Serial.print("ERR:ECHO_MISMATCH TX=0x");
-    Serial.print(value, HEX);
-    Serial.print(" RX=0x");
-    Serial.println(echo, HEX);
+    printEchoMismatchError(Serial, value, echo);
+    printEchoMismatchError(Serial2, value, echo);
     return false;
   }
 
@@ -314,18 +315,16 @@ bool send9WithEchoCheck(uint16_t value) {
 bool sendSeaTalkDatagram(const uint8_t *bytes, uint8_t len) {
   if (len < 3 || len > ST_MAX_DGRAM) {
     Serial.println("ERR:BAD_TX_LEN");
+    Serial2.println("ERR:BAD_TX_LEN");
     return false;
   }
 
-  Serial.print("ST_TX:");
-  for (uint8_t i = 0; i < len; i++) {
-    Serial.print(" ");
-    printHex2(bytes[i]);
-  }
-  Serial.println();
+  printTxDatagram(Serial, bytes, len);
+  printTxDatagram(Serial2, bytes, len);
 
 #if ENABLE_SEATALK_TX == 0
   Serial.println("WOULD_TX:ENABLE_SEATALK_TX_IS_0");
+  Serial2.println("WOULD_TX:ENABLE_SEATALK_TX_IS_0");
   return false;
 #else
   if (!waitForSeaTalkIdle(SEATALK_IDLE_US, SEATALK_TX_TIMEOUT_MS)) {
@@ -347,6 +346,7 @@ bool sendSeaTalkDatagram(const uint8_t *bytes, uint8_t len) {
   }
 
   Serial.println("TX_OK");
+  Serial2.println("TX_OK");
   return true;
 #endif
 }
@@ -376,6 +376,8 @@ void sendKeyDatagram(uint8_t keyCode) {
 void handleButtonCommand(const char *cmd) {
   Serial.print("BUTTON:");
   Serial.println(cmd);
+  Serial2.print("BUTTON:");
+  Serial2.println(cmd);
 
   if (strcmp(cmd, "AUTO") == 0) {
     sendKeyDatagram(0x01);
@@ -401,6 +403,8 @@ void handleButtonCommand(const char *cmd) {
   } else {
     Serial.print("ERR:UNKNOWN_BTN:");
     Serial.println(cmd);
+    Serial2.print("ERR:UNKNOWN_BTN:");
+    Serial2.println(cmd);
   }
 }
 
@@ -758,12 +762,49 @@ void printStatusLine() {
 
 // ===================== UTILS =====================
 
-void printHex2(uint8_t b) {
+void printTxDatagram(Print &out, const uint8_t *bytes, uint8_t len) {
+  out.print("ST_TX:");
+  for (uint8_t i = 0; i < len; i++) {
+    out.print(" ");
+    printHex2To(out, bytes[i]);
+  }
+  out.println();
+}
+
+
+void printBusNotIdleError(Print &out) {
+  out.print("ERR:BUS_NOT_IDLE;SENSE_PIN_22=");
+  out.print(rawSeaTalkIdleSenseHigh() ? "HIGH" : "LOW");
+  out.print(";BUS_IDLE=");
+  out.println(seaTalkBusIdle() ? "YES" : "NO");
+}
+
+
+void printNoEchoError(Print &out, uint16_t value) {
+  out.print("ERR:NO_ECHO TX=0x");
+  out.println(value, HEX);
+}
+
+
+void printEchoMismatchError(Print &out, uint16_t value, uint16_t echo) {
+  out.print("ERR:ECHO_MISMATCH TX=0x");
+  out.print(value, HEX);
+  out.print(" RX=0x");
+  out.println(echo, HEX);
+}
+
+
+void printHex2To(Print &out, uint8_t b) {
   if (b < 0x10) {
-    Serial.print("0");
+    out.print("0");
   }
 
-  Serial.print(b, HEX);
+  out.print(b, HEX);
+}
+
+
+void printHex2(uint8_t b) {
+  printHex2To(Serial, b);
 }
 
 
