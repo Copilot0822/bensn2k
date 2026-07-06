@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
-const STORAGE_KEY = 'm5-marine-dashboard-layout-v3'
+const STORAGE_KEY = 'm5-marine-dashboard-layout-v4'
 const CONTROL_KEY = 'm5-marine-dashboard-controls-v1'
 const COMMAND_COOLDOWN_MS = 900
 const CONFIRM_WINDOW_MS = 2500
@@ -13,7 +13,7 @@ const MAX_WIDGET_HEIGHT = 8
 const widgetCatalog = [
   { id: 'heroInstruments', label: 'Large Heading', type: 'special', defaultSize: { w: 6, h: 2 } },
   { id: 'heading', label: 'Heading', type: 'metric', unit: 'deg', precision: 0, defaultSize: { w: 2, h: 1 } },
-  { id: 'awa', label: 'Apparent Wind Angle', type: 'metric', unit: 'deg', precision: 0, defaultSize: { w: 2, h: 1 } },
+  { id: 'awa', label: 'Apparent Wind Angle', type: 'metric', unit: '', precision: 0, defaultSize: { w: 2, h: 1 } },
   { id: 'sog', label: 'SOG', type: 'metric', unit: 'kt', precision: 1, defaultSize: { w: 2, h: 1 } },
   { id: 'cog', label: 'COG', type: 'metric', unit: 'deg', precision: 0, defaultSize: { w: 2, h: 1 } },
   { id: 'depth', label: 'Depth', type: 'metric', unit: 'm', precision: 1, defaultSize: { w: 2, h: 1 } },
@@ -23,12 +23,15 @@ const widgetCatalog = [
   { id: 'battery1', label: 'Battery 1', type: 'metric', unit: 'V', precision: 2, defaultSize: { w: 2, h: 1 } },
   { id: 'batteryDiff', label: 'Battery Diff', type: 'metric', unit: 'V', precision: 2, defaultSize: { w: 2, h: 1 } },
   { id: 'autopilotMode', label: 'Autopilot Mode', type: 'metric', unit: '', precision: 0, defaultSize: { w: 2, h: 1 } },
-  { id: 'targetHeading', label: 'Target Heading', type: 'metric', unit: 'deg', precision: 0, defaultSize: { w: 2, h: 1 } },
+  { id: 'targetHeading', label: 'Pilot Heading', type: 'metric', unit: 'deg', precision: 0, defaultSize: { w: 2, h: 1 } },
+  { id: 'windTargetDisplay', label: 'Wind Target', type: 'metric', unit: '', precision: 0, defaultSize: { w: 2, h: 1 } },
   { id: 'seatalkStatus', label: 'SeaTalk 1', type: 'metric', unit: '', precision: 0, defaultSize: { w: 2, h: 1 } },
   { id: 'n2kStatus', label: 'N2K', type: 'metric', unit: '', precision: 0, defaultSize: { w: 2, h: 1 } },
+  { id: 'windStatus', label: 'Wind Data', type: 'metric', unit: '', precision: 0, defaultSize: { w: 2, h: 1 } },
   { id: 'wifiClients', label: 'Wi-Fi Clients', type: 'metric', unit: '', precision: 0, defaultSize: { w: 2, h: 1 } },
   { id: 'electricalWarnings', label: 'Electrical Warnings', type: 'special', defaultSize: { w: 4, h: 1 } },
   { id: 'autopilotPanel', label: 'Autopilot Controls', type: 'special', defaultSize: { w: 8, h: 4 } },
+  { id: 'windOffsetPanel', label: 'Wind Offset', type: 'special', defaultSize: { w: 4, h: 2 } },
   { id: 'rawSeatalk', label: 'Raw SeaTalk 1', type: 'special', defaultSize: { w: 4, h: 2 } },
   { id: 'decodedSeatalk', label: 'Decoded SeaTalk 1', type: 'special', defaultSize: { w: 4, h: 2 } },
   { id: 'rawN2k', label: 'Raw N2K PGNs', type: 'special', defaultSize: { w: 4, h: 2 } },
@@ -47,12 +50,14 @@ const defaultPages = [
     'rudderAngle',
     'autopilotMode',
     'targetHeading',
+    'windTargetDisplay',
     'seatalkStatus',
     'autopilotPanel',
+    'windOffsetPanel',
   ]),
   createPage('sailing', 'Sailing', ['awa', 'heading', 'sog', 'cog', 'depth', 'waterTemp', 'rudderAngle']),
   createPage('electrical', 'Electrical', ['battery0', 'battery1', 'batteryDiff', 'electricalWarnings', 'wifiClients']),
-  createPage('debug', 'Debug', ['seatalkStatus', 'n2kStatus', 'rawSeatalk', 'decodedSeatalk', 'rawN2k', 'packetCounters']),
+  createPage('debug', 'Debug', ['seatalkStatus', 'n2kStatus', 'windStatus', 'rawSeatalk', 'decodedSeatalk', 'rawN2k', 'packetCounters']),
 ]
 
 const defaultLayout = {
@@ -60,33 +65,41 @@ const defaultLayout = {
   activePageId: 'helm',
 }
 
-const initialData = {
-  heading: 184,
-  cog: 181,
-  sog: 5.4,
-  awa: 38,
-  depth: 12.4,
-  waterTemp: 18.6,
-  rudderAngle: -3,
-  battery0: 12.72,
-  battery1: 12.64,
-  autopilotMode: 'AUTO',
-  targetHeading: 185,
-  seatalkStatus: 'ok',
-  n2kStatus: 'ok',
-  seatalkLastSeenMs: 150,
-  n2kLastSeenMs: 120,
-  wifiClients: 2,
-  uptime: 123456,
+const blankData = {
+  plcOnline: false,
+  heading: null,
+  cog: null,
+  sog: null,
+  awa: null,
+  awaDisplay: null,
+  awaRaw: null,
+  windOffset: null,
+  windStatus: null,
+  windLastSeenMs: null,
+  windTargetAngle: null,
+  windTargetDisplay: null,
+  depth: null,
+  waterTemp: null,
+  rudderAngle: null,
+  battery0: null,
+  battery1: null,
+  autopilotMode: null,
+  targetHeading: null,
+  seatalkStatus: null,
+  n2kStatus: null,
+  seatalkLastSeenMs: null,
+  n2kLastSeenMs: null,
+  wifiClients: null,
+  uptime: null,
   packetCounters: {
-    seatalkRaw: 814,
-    seatalkDecoded: 773,
-    n2kPgn: 432,
-    errors: 0,
+    seatalkRaw: null,
+    seatalkDecoded: null,
+    n2kPgn: null,
+    errors: null,
   },
-  rawSeatalk: ['84 20 B8 00', '89 02 7A 10', '9C 10 02 F1'],
-  decodedSeatalk: ['Compass heading 184 deg', 'Rudder angle -3 deg', 'Pilot mode AUTO'],
-  rawN2k: ['127250 heading', '128259 speed', '128267 depth', '130306 wind'],
+  rawSeatalk: [],
+  decodedSeatalk: [],
+  rawN2k: [],
 }
 
 function createPage(id, name, widgets = []) {
@@ -147,58 +160,45 @@ function clampHeading(value) {
   return Math.round((value + 360) % 360)
 }
 
-function makeMockData(previous, started) {
-  const t = (Date.now() - started) / 1000
-  const heading = clampHeading(184 + Math.sin(t / 8) * 6)
-  const cog = clampHeading(181 + Math.sin(t / 9) * 5)
-  const sog = 5.4 + Math.sin(t / 6) * 0.4
-  const awa = Math.round(38 + Math.sin(t / 4) * 9)
-  const rudderAngle = Math.round(Math.sin(t / 2.8) * 8)
-  const battery0 = 12.72 - t * 0.0008 + Math.sin(t / 10) * 0.02
-  const battery1 = 12.64 - t * 0.0006 + Math.cos(t / 12) * 0.02
+function normalizeSignedDegrees(value) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return null
+  let degrees = ((value % 360) + 360) % 360
+  if (degrees > 180) degrees -= 360
+  return degrees
+}
 
+function formatRelativeWindAngle(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return '--'
+  let rounded = Math.round(((value % 360) + 360) % 360)
+  if (rounded >= 360) rounded -= 360
+  if (rounded === 0) return '0'
+  if (rounded === 180) return '180'
+  return rounded < 180 ? `${rounded}S` : `${360 - rounded}P`
+}
+
+function formatAge(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? `${value} ms` : '--'
+}
+
+function normalizeIncomingData(nextData) {
   return {
-    ...previous,
-    heading,
-    cog,
-    sog,
-    awa,
-    depth: 12.4 + Math.sin(t / 7) * 0.25,
-    waterTemp: 18.6 + Math.sin(t / 22) * 0.18,
-    rudderAngle,
-    battery0,
-    battery1,
-    batteryDiff: battery0 - battery1,
-    targetHeading: clampHeading(heading + 1),
-    seatalkLastSeenMs: 90 + Math.round(Math.abs(Math.sin(t)) * 260),
-    n2kLastSeenMs: 110 + Math.round(Math.abs(Math.cos(t / 1.4)) * 220),
-    wifiClients: 2 + (Math.floor(t / 18) % 2),
-    uptime: initialData.uptime + Math.round(t * 1000),
+    ...blankData,
+    ...nextData,
+    plcOnline: true,
     packetCounters: {
-      seatalkRaw: initialData.packetCounters.seatalkRaw + Math.floor(t * 7),
-      seatalkDecoded: initialData.packetCounters.seatalkDecoded + Math.floor(t * 6),
-      n2kPgn: initialData.packetCounters.n2kPgn + Math.floor(t * 5),
-      errors: 0,
+      ...blankData.packetCounters,
+      ...(nextData.packetCounters || {}),
     },
-    rawSeatalk: [
-      `84 20 ${heading.toString(16).padStart(2, '0').toUpperCase()} 00`,
-      `89 02 ${(128 + rudderAngle).toString(16).padStart(2, '0').toUpperCase()} 10`,
-      previous.autopilotMode === 'STANDBY' ? '9C 00 02 F1' : '9C 10 02 F1',
-    ],
-    decodedSeatalk: [
-      `Compass heading ${heading} deg`,
-      `Rudder angle ${rudderAngle} deg`,
-      `Pilot mode ${previous.autopilotMode}`,
-    ],
+    rawSeatalk: Array.isArray(nextData.rawSeatalk) ? nextData.rawSeatalk : [],
+    decodedSeatalk: Array.isArray(nextData.decodedSeatalk) ? nextData.decodedSeatalk : [],
+    rawN2k: Array.isArray(nextData.rawN2k) ? nextData.rawN2k : [],
   }
 }
 
 function useMarineData() {
-  const [data, setData] = useState(initialData)
-  const apiOnline = useRef(false)
+  const [data, setData] = useState(blankData)
 
   useEffect(() => {
-    const started = Date.now()
     let cancelled = false
 
     async function pollApi() {
@@ -213,11 +213,12 @@ function useMarineData() {
         if (!response.ok) throw new Error(`Data endpoint returned ${response.status}`)
         const nextData = await response.json()
         if (!cancelled) {
-          apiOnline.current = true
-          setData((previous) => ({ ...previous, ...nextData }))
+          setData(normalizeIncomingData(nextData))
         }
       } catch {
-        apiOnline.current = false
+        if (!cancelled) {
+          setData(blankData)
+        }
       } finally {
         window.clearTimeout(timeout)
       }
@@ -227,9 +228,6 @@ function useMarineData() {
 
     const interval = window.setInterval(() => {
       pollApi()
-      if (!apiOnline.current) {
-        setData((previous) => makeMockData(previous, started))
-      }
     }, 1000)
 
     return () => {
@@ -242,20 +240,30 @@ function useMarineData() {
 }
 
 function StatusStrip({ data }) {
-  const seatalkStale = data.seatalkLastSeenMs > STALE_MS
-  const n2kStale = data.n2kLastSeenMs > STALE_MS
+  const plcOffline = !data.plcOnline
+  const seatalkStale = plcOffline || data.seatalkLastSeenMs > STALE_MS
+  const n2kStale = plcOffline || data.n2kLastSeenMs > STALE_MS
+  const windStale = plcOffline || data.windStatus !== 'ok'
 
   return (
     <section className="status-strip" aria-label="Network status">
       <div>
+        <span className={plcOffline ? 'status-dot bad' : 'status-dot'} />
+        PLC {plcOffline ? 'offline' : 'online'}
+      </div>
+      <div>
         <span className={seatalkStale ? 'status-dot bad' : 'status-dot'} />
-        SeaTalk 1 {data.seatalkStatus} · {data.seatalkLastSeenMs} ms
+        SeaTalk 1 {formatValue(data.seatalkStatus)} · {formatAge(data.seatalkLastSeenMs)}
       </div>
       <div>
         <span className={n2kStale ? 'status-dot bad' : 'status-dot'} />
-        N2K {data.n2kStatus} · {data.n2kLastSeenMs} ms
+        N2K {formatValue(data.n2kStatus)} · {formatAge(data.n2kLastSeenMs)}
       </div>
-      <div>AP clients {data.wifiClients}</div>
+      <div>
+        <span className={windStale ? 'status-dot bad' : 'status-dot'} />
+        Wind {formatValue(data.windStatus)} · {formatAge(data.windLastSeenMs)}
+      </div>
+      <div>AP clients {formatValue(data.wifiClients)}</div>
     </section>
   )
 }
@@ -363,7 +371,16 @@ function DashboardTile({ widget, size, children, onResize }) {
 }
 
 function MetricCard({ widget, data }) {
-  const value = widget.id === 'batteryDiff' ? data.battery0 - data.battery1 : data[widget.id]
+  let value = data[widget.id]
+  let unit = widget.unit
+
+  if (widget.id === 'batteryDiff') {
+    value = typeof data.battery0 === 'number' && typeof data.battery1 === 'number' ? data.battery0 - data.battery1 : null
+  } else if (widget.id === 'awa') {
+    value = data.awaDisplay || formatRelativeWindAngle(data.awa)
+    unit = ''
+  }
+
   const isVoltageWarning =
     (widget.id === 'battery0' || widget.id === 'battery1') && typeof value === 'number' && value < 12.2
   const statusClass = value === 'ok' ? 'good' : value === 'warn' ? 'warn' : ''
@@ -374,7 +391,7 @@ function MetricCard({ widget, data }) {
       <AutoFitText
         className={statusClass}
         value={formatValue(value, widget.precision)}
-        unit={widget.unit}
+        unit={unit}
         min={20}
         max={360}
       />
@@ -392,7 +409,7 @@ function HeroInstruments({ data }) {
       <div className="hero-stack">
         <div>
           <span>AWA</span>
-          <AutoFitText value={formatValue(data.awa, 0)} unit="deg" min={18} max={180} />
+          <AutoFitText value={data.awaDisplay || formatRelativeWindAngle(data.awa)} min={18} max={180} />
         </div>
         <div>
           <span>SOG / COG</span>
@@ -407,12 +424,32 @@ function HeroInstruments({ data }) {
   )
 }
 
-function AutopilotPanel({ data, setData, controlsEnabled, setControlsEnabled }) {
+function useCommandCooldown() {
   const [cooldownActive, setCooldownActive] = useState(false)
+  const cooldownTimer = useRef(null)
+
+  function startCooldown() {
+    setCooldownActive(true)
+    cooldownTimer.current = window.setTimeout(() => {
+      setCooldownActive(false)
+      cooldownTimer.current = null
+    }, COMMAND_COOLDOWN_MS)
+  }
+
+  useEffect(() => {
+    return () => {
+      if (cooldownTimer.current) window.clearTimeout(cooldownTimer.current)
+    }
+  }, [])
+
+  return { cooldownActive, startCooldown }
+}
+
+function AutopilotPanel({ data, setData, controlsEnabled, setControlsEnabled }) {
   const [armedCommand, setArmedCommand] = useState('')
   const [commandLog, setCommandLog] = useState([])
-  const cooldownTimer = useRef(null)
   const confirmTimer = useRef(null)
+  const { cooldownActive, startCooldown } = useCommandCooldown()
   const disabledByStale = data.seatalkStatus !== 'ok' || data.seatalkLastSeenMs > STALE_MS
   const controlsLocked = !controlsEnabled || disabledByStale || cooldownActive
 
@@ -422,7 +459,6 @@ function AutopilotPanel({ data, setData, controlsEnabled, setControlsEnabled }) 
 
   useEffect(() => {
     return () => {
-      if (cooldownTimer.current) window.clearTimeout(cooldownTimer.current)
       if (confirmTimer.current) window.clearTimeout(confirmTimer.current)
     }
   }, [])
@@ -433,11 +469,7 @@ function AutopilotPanel({ data, setData, controlsEnabled, setControlsEnabled }) 
 
   function sendCommand(command, value) {
     if (cooldownActive) return
-    setCooldownActive(true)
-    cooldownTimer.current = window.setTimeout(() => {
-      setCooldownActive(false)
-      cooldownTimer.current = null
-    }, COMMAND_COOLDOWN_MS)
+    startCooldown()
     appendLog(value === undefined ? command : `${command} ${value}`)
 
     fetch('/api/autopilot', {
@@ -453,8 +485,29 @@ function AutopilotPanel({ data, setData, controlsEnabled, setControlsEnabled }) 
       if (command === 'auto') return { ...previous, autopilotMode: 'AUTO' }
       if (command === 'wind') return { ...previous, autopilotMode: 'WIND' }
       if (command === 'track') return { ...previous, autopilotMode: 'TRACK' }
+      if (
+        (command === 'tack_port' || command === 'tack_starboard') &&
+        previous.autopilotMode === 'WIND' &&
+        typeof previous.windTargetAngle === 'number'
+      ) {
+        const windTargetAngle = ((360 - previous.windTargetAngle) % 360 + 360) % 360
+        return {
+          ...previous,
+          windTargetAngle,
+          windTargetDisplay: formatRelativeWindAngle(windTargetAngle),
+        }
+      }
       if (command === 'heading_delta') {
-        return { ...previous, targetHeading: clampHeading(previous.targetHeading + value) }
+        const updates = {}
+        if (typeof previous.targetHeading === 'number') {
+          updates.targetHeading = clampHeading(previous.targetHeading + value)
+        }
+        if (previous.autopilotMode === 'WIND' && typeof previous.windTargetAngle === 'number') {
+          const windTargetAngle = ((previous.windTargetAngle + value) % 360 + 360) % 360
+          updates.windTargetAngle = windTargetAngle
+          updates.windTargetDisplay = formatRelativeWindAngle(windTargetAngle)
+        }
+        return { ...previous, ...updates }
       }
       return previous
     })
@@ -485,7 +538,7 @@ function AutopilotPanel({ data, setData, controlsEnabled, setControlsEnabled }) 
       <div className="panel-header">
         <div>
           <span className="eyebrow">Autopilot</span>
-          <h2>{data.autopilotMode}</h2>
+          <h2>{formatValue(data.autopilotMode)}</h2>
         </div>
         <label className="control-toggle">
           <input
@@ -498,6 +551,17 @@ function AutopilotPanel({ data, setData, controlsEnabled, setControlsEnabled }) 
       </div>
 
       {disabledByStale && <div className="safety-message">Pilot commands disabled: SeaTalk 1 data is stale.</div>}
+
+      <div className="pilot-readouts">
+        <div>
+          <span>Pilot Heading</span>
+          <strong>{formatValue(data.targetHeading, 0)}{typeof data.targetHeading === 'number' ? ' deg' : ''}</strong>
+        </div>
+        <div>
+          <span>Wind Target</span>
+          <strong>{formatValue(data.windTargetDisplay)}</strong>
+        </div>
+      </div>
 
       <button
         type="button"
@@ -565,6 +629,120 @@ function AutopilotPanel({ data, setData, controlsEnabled, setControlsEnabled }) 
   )
 }
 
+function WindOffsetPanel({ data, setData, controlsEnabled }) {
+  const [commandLog, setCommandLog] = useState([])
+  const { cooldownActive, startCooldown } = useCommandCooldown()
+  const windConfigDisabled = !controlsEnabled || !data.plcOnline || cooldownActive
+  const windOffsetText = typeof data.windOffset === 'number' ? `${data.windOffset.toFixed(1)} deg` : '--'
+  const rawText = typeof data.awaRaw === 'number' ? `${data.awaRaw.toFixed(1)} deg` : '--'
+  const adjustedText = data.awaDisplay || formatRelativeWindAngle(data.awa)
+
+  function appendLog(command) {
+    setCommandLog((entries) => [{ at: new Date().toLocaleTimeString(), command }, ...entries.slice(0, 3)])
+  }
+
+  function applyWindConfig(body, label, optimisticOffset = null) {
+    if (windConfigDisabled) return
+    startCooldown()
+    appendLog(label)
+
+    if (typeof optimisticOffset === 'number') {
+      setData((previous) => ({
+        ...previous,
+        windOffset: optimisticOffset,
+        awa:
+          typeof previous.awaRaw === 'number'
+            ? ((previous.awaRaw + optimisticOffset) % 360 + 360) % 360
+            : previous.awa,
+        awaDisplay:
+          typeof previous.awaRaw === 'number'
+            ? formatRelativeWindAngle(previous.awaRaw + optimisticOffset)
+            : previous.awaDisplay,
+      }))
+    }
+
+    fetch('/api/wind-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Wind config returned ${response.status}`)
+        return response.json()
+      })
+      .then((config) => {
+        setData((previous) => ({
+          ...previous,
+          windOffset: typeof config.offset === 'number' ? config.offset : previous.windOffset,
+          awa: typeof config.adjustedAngle === 'number' ? config.adjustedAngle : previous.awa,
+          awaDisplay: config.display ?? previous.awaDisplay,
+          windStatus: config.status ?? previous.windStatus,
+          windTargetAngle:
+            typeof config.windTargetAngle === 'number' ? config.windTargetAngle : previous.windTargetAngle,
+          windTargetDisplay: config.windTargetDisplay ?? previous.windTargetDisplay,
+        }))
+      })
+      .catch(() => {
+        // The next /data poll will restore the authoritative PLC state.
+      })
+  }
+
+  function nudgeWindOffset(delta) {
+    const currentOffset = typeof data.windOffset === 'number' ? data.windOffset : 0
+    const nextOffset = normalizeSignedDegrees(currentOffset + delta) ?? 0
+    applyWindConfig({ offset: nextOffset }, `offset ${nextOffset.toFixed(1)}`, nextOffset)
+  }
+
+  function zeroWindToBow() {
+    const nextOffset = typeof data.awaRaw === 'number' ? normalizeSignedDegrees(-data.awaRaw) : null
+    applyWindConfig({ zeroToBow: true }, 'zero bow', nextOffset)
+  }
+
+  return (
+    <section className="wind-offset-panel" aria-label="Wind offset controls">
+      <div className="panel-header compact">
+        <div>
+          <span className="eyebrow">Wind Offset</span>
+          <h2>{windOffsetText}</h2>
+        </div>
+      </div>
+
+      <div className="wind-offset-readouts">
+        <div><span>AWA</span><strong>{adjustedText}</strong></div>
+        <div><span>Raw</span><strong>{rawText}</strong></div>
+      </div>
+
+      <div className="pilot-grid wind-offset-grid">
+        {[[-10, '-10'], [-1, '-1'], [1, '+1'], [10, '+10']].map(([delta, label]) => (
+          <button
+            type="button"
+            key={label}
+            className="pilot-button"
+            disabled={windConfigDisabled}
+            onClick={() => nudgeWindOffset(delta)}
+          >
+            {label}
+          </button>
+        ))}
+        <button
+          type="button"
+          className="pilot-button"
+          disabled={windConfigDisabled || typeof data.awaRaw !== 'number'}
+          onClick={zeroWindToBow}
+        >
+          Zero Bow
+        </button>
+      </div>
+
+      <div className="command-log" aria-live="polite">
+        {commandLog.length === 0
+          ? 'No offset changes this session'
+          : commandLog.map((entry) => <span key={`${entry.at}-${entry.command}`}>{entry.at} {entry.command}</span>)}
+      </div>
+    </section>
+  )
+}
+
 function ConfirmButton({ command, label, disabled, armed, onConfirm }) {
   const text = label || command.toUpperCase()
 
@@ -582,14 +760,21 @@ function ConfirmButton({ command, label, disabled, armed, onConfirm }) {
 }
 
 function ElectricalWarnings({ data }) {
-  const low = [data.battery0, data.battery1].some((value) => value < 12.2)
-  const diff = Math.abs(data.battery0 - data.battery1)
+  const batteryValues = [data.battery0, data.battery1].filter((value) => typeof value === 'number')
+  const low = batteryValues.some((value) => value < 12.2)
+  const diff =
+    typeof data.battery0 === 'number' && typeof data.battery1 === 'number'
+      ? Math.abs(data.battery0 - data.battery1)
+      : null
+  const highDiff = typeof diff === 'number' && diff > 0.35
   return (
-    <section className={`warning-band ${low || diff > 0.35 ? 'active' : ''}`}>
-      <strong>{low || diff > 0.35 ? 'Electrical warning' : 'Electrical normal'}</strong>
+    <section className={`warning-band ${low || highDiff ? 'active' : ''}`}>
+      <strong>{low || highDiff ? 'Electrical warning' : 'Electrical normal'}</strong>
       <span>
         {low ? 'One battery is below 12.2 V. ' : ''}
-        {diff > 0.35 ? 'Battery voltage difference is high.' : `Voltage difference ${diff.toFixed(2)} V.`}
+        {highDiff
+          ? 'Battery voltage difference is high.'
+          : `Voltage difference ${typeof diff === 'number' ? diff.toFixed(2) : '--'} V.`}
       </span>
     </section>
   )
@@ -609,12 +794,13 @@ function PacketCounters({ data }) {
     <article className="debug-block">
       <h3>Packet Counters</h3>
       <dl>
-        <div><dt>SeaTalk raw</dt><dd>{data.packetCounters.seatalkRaw}</dd></div>
-        <div><dt>SeaTalk decoded</dt><dd>{data.packetCounters.seatalkDecoded}</dd></div>
-        <div><dt>N2K PGNs</dt><dd>{data.packetCounters.n2kPgn}</dd></div>
-        <div><dt>Bus errors</dt><dd>{data.packetCounters.errors}</dd></div>
-        <div><dt>SeaTalk age</dt><dd>{data.seatalkLastSeenMs} ms</dd></div>
-        <div><dt>N2K age</dt><dd>{data.n2kLastSeenMs} ms</dd></div>
+        <div><dt>SeaTalk raw</dt><dd>{formatValue(data.packetCounters.seatalkRaw)}</dd></div>
+        <div><dt>SeaTalk decoded</dt><dd>{formatValue(data.packetCounters.seatalkDecoded)}</dd></div>
+        <div><dt>N2K PGNs</dt><dd>{formatValue(data.packetCounters.n2kPgn)}</dd></div>
+        <div><dt>Bus errors</dt><dd>{formatValue(data.packetCounters.errors)}</dd></div>
+        <div><dt>SeaTalk age</dt><dd>{formatAge(data.seatalkLastSeenMs)}</dd></div>
+        <div><dt>N2K age</dt><dd>{formatAge(data.n2kLastSeenMs)}</dd></div>
+        <div><dt>Wind age</dt><dd>{formatAge(data.windLastSeenMs)}</dd></div>
       </dl>
     </article>
   )
@@ -633,6 +819,9 @@ function WidgetContent({ widget, data, setData, controlsEnabled, setControlsEnab
         setControlsEnabled={setControlsEnabled}
       />
     )
+  }
+  if (widget.id === 'windOffsetPanel') {
+    return <WindOffsetPanel data={data} setData={setData} controlsEnabled={controlsEnabled} />
   }
   if (widget.id === 'rawSeatalk') return <DebugBlock title="Raw SeaTalk 1" lines={data.rawSeatalk} />
   if (widget.id === 'decodedSeatalk') return <DebugBlock title="Decoded SeaTalk 1" lines={data.decodedSeatalk} />

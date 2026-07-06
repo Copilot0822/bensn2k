@@ -693,6 +693,14 @@ void parseKey86(const uint8_t *d, uint8_t len) {
   Serial.print(";INV=0x");
   printHex2(d[3]);
   Serial.println();
+
+  Serial2.print("KEY86:SRC=0x");
+  printHex2To(Serial2, d[1]);
+  Serial2.print(";KEY=0x");
+  printHex2To(Serial2, d[2]);
+  Serial2.print(";INV=0x");
+  printHex2To(Serial2, d[3]);
+  Serial2.println();
 }
 
 

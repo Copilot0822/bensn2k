@@ -89,11 +89,18 @@ struct SeatalkState {
   float targetHeadingDeg;
   float compassHeadingDeg;
   float windAngleDeg;
+  uint32_t windAngleLastMs;
   uint32_t dueLastSeenMs;
   uint32_t lastSeenMs;
   uint32_t rawPacketCount;
   uint32_t decodedPacketCount;
   uint32_t errorCount;
+};
+
+struct WindTargetState {
+  bool valid;
+  float angleDeg;
+  uint32_t lastSetMs;
 };
 
 struct N2kRxState {
@@ -130,7 +137,8 @@ BatteryChannel batteries[] = {
 constexpr size_t kBatteryCount = sizeof(batteries) / sizeof(batteries[0]);
 
 WindState wind = {false, NAN, 0.0f, 0, 0, 0, IPAddress(0, 0, 0, 0)};
-SeatalkState seatalk = {false, false, "--", NAN, NAN, NAN, NAN, 0, 0, 0, 0, 0};
+SeatalkState seatalk = {false, false, "--", NAN, NAN, NAN, NAN, 0, 0, 0, 0, 0, 0};
+WindTargetState windTarget = {false, NAN, 0};
 N2kRxState n2kRx = {NAN, NAN, NAN, NAN, NAN, 0, 0, 0, 0, 0, 0, 0};
 DisplayMode displayMode = DisplayMode::Summary;
 bool canBusEnabled = false;
@@ -185,6 +193,14 @@ float wrapDegrees(float degrees) {
   return degrees;
 }
 
+float normalizeSignedDegrees(float degrees) {
+  degrees = wrapDegrees(degrees);
+  if (degrees > 180.0f) {
+    degrees -= 360.0f;
+  }
+  return degrees;
+}
+
 bool windFresh(uint32_t now) {
   return wind.valid && (now - wind.lastPacketMs <= kWindFreshMs);
 }
@@ -194,6 +210,91 @@ float adjustedWindAngleDeg() {
     return NAN;
   }
   return wrapDegrees(wind.rawAngleDeg + wind.offsetDeg);
+}
+
+bool seatalkWindFresh(uint32_t now) {
+  return !isnan(seatalk.windAngleDeg) && seatalk.windAngleLastMs != 0 &&
+         (now - seatalk.windAngleLastMs <= kSeatalkFreshMs);
+}
+
+bool latestApparentWindAngleDeg(uint32_t now, float& angleDeg) {
+  if (seatalkWindFresh(now)) {
+    angleDeg = seatalk.windAngleDeg;
+    return true;
+  }
+
+  if (wind.valid && !isnan(wind.rawAngleDeg)) {
+    angleDeg = adjustedWindAngleDeg();
+    return !isnan(angleDeg);
+  }
+
+  return false;
+}
+
+void captureWindTarget(uint32_t now) {
+  float angleDeg = NAN;
+  if (!latestApparentWindAngleDeg(now, angleDeg)) {
+    return;
+  }
+
+  windTarget.valid = true;
+  windTarget.angleDeg = wrapDegrees(angleDeg);
+  windTarget.lastSetMs = now;
+}
+
+void adjustWindTarget(float deltaDeg, uint32_t now) {
+  if (!windTarget.valid || isnan(windTarget.angleDeg)) {
+    captureWindTarget(now);
+  }
+
+  if (!windTarget.valid || isnan(windTarget.angleDeg)) {
+    return;
+  }
+
+  windTarget.angleDeg = wrapDegrees(windTarget.angleDeg + deltaDeg);
+  windTarget.lastSetMs = now;
+}
+
+void mirrorWindTarget(uint32_t now) {
+  if (!windTarget.valid || isnan(windTarget.angleDeg)) {
+    captureWindTarget(now);
+  }
+
+  if (!windTarget.valid || isnan(windTarget.angleDeg)) {
+    return;
+  }
+
+  windTarget.angleDeg = wrapDegrees(360.0f - windTarget.angleDeg);
+  windTarget.lastSetMs = now;
+}
+
+String formatRelativeWindAngle(float angleDeg) {
+  if (isnan(angleDeg)) {
+    return "--";
+  }
+
+  int rounded = static_cast<int>(roundf(wrapDegrees(angleDeg)));
+  if (rounded >= 360) {
+    rounded -= 360;
+  }
+
+  if (rounded == 0) {
+    return "0";
+  }
+  if (rounded == 180) {
+    return "180";
+  }
+  if (rounded < 180) {
+    return String(rounded) + "S";
+  }
+  return String(360 - rounded) + "P";
+}
+
+String windStatusString(uint32_t now) {
+  if (!wind.valid) {
+    return "missing";
+  }
+  return windFresh(now) ? "ok" : "stale";
 }
 
 String formatIp(const IPAddress& ip) {
@@ -279,6 +380,19 @@ void appendJsonNumberOrNull(String& json, const String& key, float value, uint8_
   }
 }
 
+void appendJsonStringOrNull(String& json, const String& key, const String& value, bool valid) {
+  json += "\"";
+  json += key;
+  json += "\":";
+  if (!valid) {
+    json += "null";
+    return;
+  }
+  json += "\"";
+  json += jsonEscape(value);
+  json += "\"";
+}
+
 void appendJsonLineArray(String& json, const String& key, const String lines[]) {
   json += "\"";
   json += key;
@@ -304,7 +418,7 @@ void saveWindOffset() {
 }
 
 void loadWindOffset() {
-  wind.offsetDeg = wrapDegrees(preferences.getFloat(kPreferencesOffsetKey, 0.0f));
+  wind.offsetDeg = normalizeSignedDegrees(preferences.getFloat(kPreferencesOffsetKey, 0.0f));
 }
 
 void printLine(int x, int y, uint16_t color, const String& text) {
@@ -336,8 +450,8 @@ void drawSummaryScreen(uint32_t now) {
     y += rowGap;
   }
 
-  if (windFresh(now)) {
-    printLine(marginX, y, TFT_YELLOW, "AWA " + String(adjustedWindAngleDeg(), 1) + " deg");
+  if (wind.valid && !isnan(wind.rawAngleDeg)) {
+    printLine(marginX, y, TFT_YELLOW, "AWA " + formatRelativeWindAngle(adjustedWindAngleDeg()));
   } else {
     printLine(marginX, y, TFT_ORANGE, "AWA waiting");
   }
@@ -369,8 +483,8 @@ void drawWindScreen(uint32_t now) {
   }
   y += rowGap;
 
-  if (windFresh(now)) {
-    printLine(marginX, y, TFT_YELLOW, "Adj " + String(adjustedWindAngleDeg(), 1) + " deg");
+  if (wind.valid && !isnan(wind.rawAngleDeg)) {
+    printLine(marginX, y, TFT_YELLOW, "Adj " + formatRelativeWindAngle(adjustedWindAngleDeg()));
   } else {
     printLine(marginX, y, TFT_ORANGE, "Adj stale");
   }
@@ -640,6 +754,67 @@ bool parseTextField(const char* line, const char* key, char* output, size_t outp
   return true;
 }
 
+bool parseHexByteField(const char* line, const char* key, uint8_t& value) {
+  const char* start = strstr(line, key);
+  if (start == nullptr) {
+    return false;
+  }
+
+  start += strlen(key);
+  char* end = nullptr;
+  const unsigned long parsed = strtoul(start, &end, 16);
+  if (end == start || parsed > 0xFF) {
+    return false;
+  }
+
+  value = static_cast<uint8_t>(parsed);
+  return true;
+}
+
+void processSeatalkKey86Line(const char* line, uint32_t now) {
+  uint8_t key = 0;
+  if (!parseHexByteField(line, "KEY=0x", key)) {
+    return;
+  }
+
+  if (key == 0x23) {
+    captureWindTarget(now);
+  } else if (strcmp(seatalk.mode, "WIND") == 0) {
+    switch (key) {
+      case 0x21:
+      case 0x22:
+      case 0x28:
+      case 0x61:
+      case 0x62:
+      case 0x68:
+        mirrorWindTarget(now);
+        break;
+      case 0x05:
+      case 0x45:
+      case 0x80:
+        adjustWindTarget(-1.0f, now);
+        break;
+      case 0x06:
+      case 0x46:
+      case 0x82:
+        adjustWindTarget(-10.0f, now);
+        break;
+      case 0x07:
+      case 0x47:
+      case 0x81:
+        adjustWindTarget(1.0f, now);
+        break;
+      case 0x08:
+      case 0x48:
+      case 0x83:
+        adjustWindTarget(10.0f, now);
+        break;
+      default:
+        break;
+    }
+  }
+}
+
 void processDueLine(const char* line) {
   if (line == nullptr || line[0] == '\0') {
     return;
@@ -650,12 +825,20 @@ void processDueLine(const char* line) {
   seatalk.dueLastSeenMs = now;
 
   if (strncmp(line, "STATUS:", 7) == 0) {
+    char previousMode[sizeof(seatalk.mode)];
+    strncpy(previousMode, seatalk.mode, sizeof(previousMode));
+    previousMode[sizeof(previousMode) - 1] = '\0';
+
     parseTextField(line, "MODE=", seatalk.mode, sizeof(seatalk.mode));
     parseFloatField(line, "RUDDER=", seatalk.rudderAngleDeg);
     parseFloatField(line, "SETPOINT=", seatalk.targetHeadingDeg);
     seatalk.statusValid = true;
     seatalk.lastSeenMs = now;
     ++seatalk.decodedPacketCount;
+    if (strcmp(seatalk.mode, "WIND") == 0 &&
+        (strcmp(previousMode, "WIND") != 0 || !windTarget.valid)) {
+      captureWindTarget(now);
+    }
     rememberLine(decodedSeatalkLines, String(line));
     return;
   }
@@ -669,7 +852,18 @@ void processDueLine(const char* line) {
 
   if (strncmp(line, "WIND_ANGLE:", 11) == 0) {
     seatalk.windAngleDeg = wrapDegrees(strtof(line + 11, nullptr));
+    seatalk.windAngleLastMs = now;
     seatalk.lastSeenMs = now;
+    ++seatalk.decodedPacketCount;
+    if (strcmp(seatalk.mode, "WIND") == 0 && !windTarget.valid) {
+      captureWindTarget(now);
+    }
+    rememberLine(decodedSeatalkLines, String(line));
+    return;
+  }
+
+  if (strncmp(line, "KEY86:", 6) == 0) {
+    processSeatalkKey86Line(line, now);
     ++seatalk.decodedPacketCount;
     rememberLine(decodedSeatalkLines, String(line));
     return;
@@ -734,8 +928,8 @@ void sendWindStatus() {
   }
 
   tN2kMsg message;
-  const uint32_t now = millis();
-  const double windAngle = windFresh(now) ? adjustedWindAngleDeg() * M_PI / 180.0 : N2kDoubleNA;
+  const double windAngle =
+      wind.valid && !isnan(wind.rawAngleDeg) ? adjustedWindAngleDeg() * M_PI / 180.0 : N2kDoubleNA;
 
   SetN2kWindSpeed(message, wind.sid++, kApparentWindSpeedMetersPerSecond, windAngle, N2kWind_Apparent);
   NMEA2000.SendMsg(message);
@@ -746,14 +940,14 @@ void handleButtons() {
   bool changed = false;
 
   if (M5.BtnA.wasClicked()) {
-    wind.offsetDeg = wrapDegrees(wind.offsetDeg + kOffsetStepDeg);
+    wind.offsetDeg = normalizeSignedDegrees(wind.offsetDeg + kOffsetStepDeg);
     saveWindOffset();
     Serial.printf("Wind offset %.1f deg\n", wind.offsetDeg);
     changed = true;
   }
 
   if (M5.BtnB.wasClicked()) {
-    wind.offsetDeg = wrapDegrees(wind.offsetDeg - kOffsetStepDeg);
+    wind.offsetDeg = normalizeSignedDegrees(wind.offsetDeg - kOffsetStepDeg);
     saveWindOffset();
     Serial.printf("Wind offset %.1f deg\n", wind.offsetDeg);
     changed = true;
@@ -1042,11 +1236,16 @@ bool serveFileFromSpiffs(String path) {
 
 String buildDataJson() {
   const uint32_t now = millis();
-  const bool windIsFresh = windFresh(now);
   const bool seatalkIsFresh = seatalkFresh(now);
   const bool dueIsFresh = dueFresh(now);
+  const bool windHasAngle = wind.valid && !isnan(wind.rawAngleDeg);
+  const float adjustedAwaDeg = windHasAngle ? adjustedWindAngleDeg() : NAN;
+  const bool showWindTarget =
+      seatalkIsFresh && strcmp(seatalk.mode, "WIND") == 0 && windTarget.valid &&
+      !isnan(windTarget.angleDeg);
   const uint32_t seatalkAgeMs = seatalk.lastSeenMs == 0 ? 0xFFFFFFFFUL : now - seatalk.lastSeenMs;
   const uint32_t n2kAgeMs = n2kRx.lastRxMs == 0 ? 0xFFFFFFFFUL : now - n2kRx.lastRxMs;
+  const uint32_t windAgeMs = wind.lastPacketMs == 0 ? 0xFFFFFFFFUL : now - wind.lastPacketMs;
   const float headingDeg = valueFresh(now, n2kRx.headingLastMs)
       ? n2kRx.headingDeg
       : (seatalkIsFresh ? seatalk.compassHeadingDeg : NAN);
@@ -1063,7 +1262,22 @@ String buildDataJson() {
   json += ",";
   appendJsonNumberOrNull(json, "sog", sogKn, 1);
   json += ",";
-  appendJsonNumberOrNull(json, "awa", windIsFresh ? adjustedWindAngleDeg() : NAN, 0);
+  appendJsonNumberOrNull(json, "awa", adjustedAwaDeg, 0);
+  json += ",";
+  appendJsonStringOrNull(json, "awaDisplay", formatRelativeWindAngle(adjustedAwaDeg), windHasAngle);
+  json += ",";
+  appendJsonNumberOrNull(json, "awaRaw", windHasAngle ? wind.rawAngleDeg : NAN, 1);
+  json += ",";
+  appendJsonNumberOrNull(json, "windOffset", wind.offsetDeg, 1);
+  json += ",";
+  appendJsonString(json, "windStatus", windStatusString(now));
+  json += ",\"windLastSeenMs\":";
+  json += String(windAgeMs);
+  json += ",";
+  appendJsonNumberOrNull(json, "windTargetAngle", showWindTarget ? windTarget.angleDeg : NAN, 0);
+  json += ",";
+  appendJsonStringOrNull(
+      json, "windTargetDisplay", formatRelativeWindAngle(windTarget.angleDeg), showWindTarget);
   json += ",";
   appendJsonNumberOrNull(json, "depth", freshOrNan(n2kRx.depthM, now, n2kRx.depthLastMs), 1);
   json += ",";
@@ -1152,6 +1366,35 @@ bool extractJsonNumberField(const String& body, const String& key, float& value)
   return end != start;
 }
 
+bool extractJsonBoolField(const String& body, const String& key, bool& value) {
+  const String quotedKey = "\"" + key + "\"";
+  int keyIndex = body.indexOf(quotedKey);
+  if (keyIndex < 0) {
+    return false;
+  }
+
+  int colonIndex = body.indexOf(':', keyIndex + quotedKey.length());
+  if (colonIndex < 0) {
+    return false;
+  }
+
+  int valueIndex = colonIndex + 1;
+  while (valueIndex < static_cast<int>(body.length()) && isspace(body[valueIndex])) {
+    ++valueIndex;
+  }
+
+  if (body.substring(valueIndex, valueIndex + 4) == "true") {
+    value = true;
+    return true;
+  }
+  if (body.substring(valueIndex, valueIndex + 5) == "false") {
+    value = false;
+    return true;
+  }
+
+  return false;
+}
+
 const char* mapAutopilotCommand(const String& command, const String& body) {
   if (command == "standby") {
     return "STBY";
@@ -1198,6 +1441,75 @@ void handleDataRequest() {
   webServer.send(200, "application/json", buildDataJson());
 }
 
+String buildWindConfigJson() {
+  const uint32_t now = millis();
+  const bool windHasAngle = wind.valid && !isnan(wind.rawAngleDeg);
+  const float adjustedAwaDeg = windHasAngle ? adjustedWindAngleDeg() : NAN;
+  const bool showWindTarget =
+      seatalkFresh(now) && strcmp(seatalk.mode, "WIND") == 0 && windTarget.valid &&
+      !isnan(windTarget.angleDeg);
+
+  String json;
+  json.reserve(360);
+  json += "{\"ok\":true,";
+  appendJsonNumberOrNull(json, "offset", wind.offsetDeg, 1);
+  json += ",";
+  appendJsonNumberOrNull(json, "rawAngle", windHasAngle ? wind.rawAngleDeg : NAN, 1);
+  json += ",";
+  appendJsonNumberOrNull(json, "adjustedAngle", adjustedAwaDeg, 1);
+  json += ",";
+  appendJsonStringOrNull(json, "display", formatRelativeWindAngle(adjustedAwaDeg), windHasAngle);
+  json += ",";
+  appendJsonString(json, "status", windStatusString(now));
+  json += ",";
+  appendJsonNumberOrNull(json, "windTargetAngle", showWindTarget ? windTarget.angleDeg : NAN, 1);
+  json += ",";
+  appendJsonStringOrNull(
+      json, "windTargetDisplay", formatRelativeWindAngle(windTarget.angleDeg), showWindTarget);
+  json += "}";
+  return json;
+}
+
+void handleWindConfigRequest() {
+  if (webServer.method() == HTTP_GET) {
+    webServer.send(200, "application/json", buildWindConfigJson());
+    return;
+  }
+
+  if (webServer.method() != HTTP_POST) {
+    webServer.send(405, "application/json", "{\"ok\":false,\"error\":\"method_not_allowed\"}");
+    return;
+  }
+
+  const String body = webServer.arg("plain");
+  bool changed = false;
+  bool zeroToBow = false;
+  float offset = NAN;
+
+  if (extractJsonBoolField(body, "zeroToBow", zeroToBow) && zeroToBow) {
+    if (!wind.valid || isnan(wind.rawAngleDeg)) {
+      webServer.send(409, "application/json", "{\"ok\":false,\"error\":\"wind_missing\"}");
+      return;
+    }
+    wind.offsetDeg = normalizeSignedDegrees(-wind.rawAngleDeg);
+    changed = true;
+  } else if (extractJsonNumberField(body, "offset", offset)) {
+    wind.offsetDeg = normalizeSignedDegrees(offset);
+    changed = true;
+  }
+
+  if (!changed) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_offset\"}");
+    return;
+  }
+
+  saveWindOffset();
+  Serial.printf("Wind offset %.1f deg\n", wind.offsetDeg);
+  updateDisplay();
+  lastDisplayMs = millis();
+  webServer.send(200, "application/json", buildWindConfigJson());
+}
+
 void handleAutopilotRequest() {
   const String body = webServer.arg("plain");
   const String command = extractJsonStringField(body, "command");
@@ -1215,6 +1527,18 @@ void handleAutopilotRequest() {
   }
 
   sendDueButtonCommand(dueCommand);
+  const uint32_t now = millis();
+  if (strcmp(dueCommand, "WIND") == 0) {
+    captureWindTarget(now);
+  } else if ((strcmp(dueCommand, "TACK_PORT") == 0 || strcmp(dueCommand, "TACK_STBD") == 0) &&
+             strcmp(seatalk.mode, "WIND") == 0) {
+    mirrorWindTarget(now);
+  } else if (command == "heading_delta" && strcmp(seatalk.mode, "WIND") == 0) {
+    float value = 0.0f;
+    if (extractJsonNumberField(body, "value", value)) {
+      adjustWindTarget(value, now);
+    }
+  }
   webServer.send(202, "application/json", "{\"ok\":true}");
 }
 
@@ -1297,6 +1621,8 @@ void setupWebServer() {
 
   webServer.on("/data", HTTP_GET, handleDataRequest);
   webServer.on("/api/autopilot", HTTP_POST, handleAutopilotRequest);
+  webServer.on("/api/wind-config", HTTP_GET, handleWindConfigRequest);
+  webServer.on("/api/wind-config", HTTP_POST, handleWindConfigRequest);
   webServer.onNotFound(handleNotFound);
   webServer.begin();
 
